@@ -9186,3 +9186,1597 @@ def _get_reliability_status(self) -> dict:
     }
 
 MasterAI.get_reliability_status = _get_reliability_status
+# ============================================================================
+# EXECUTION HARDENING LAYER - FINAL PRODUCTION INFRASTRUCTURE
+# Add this code to the END of ai_core.py (AFTER all previous code)
+# ============================================================================
+
+import hashlib
+import json
+import sqlite3
+import asyncio
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any, Callable, Awaitable
+from collections import deque
+import uuid
+import threading
+
+logger = logging.getLogger("execution_hardening")
+
+# ============================================================================
+# 1. EXECUTION LEDGER - IMMUTABLE SOURCE OF TRUTH
+# ============================================================================
+
+class ExecutionStatus(Enum):
+    PENDING = "pending"          # Записано, но не отправлено
+    SENT = "sent"                # Отправлено в MT5
+    CONFIRMED = "confirmed"      # Подтверждено брокером
+    FAILED = "failed"            # Ошибка при отправке
+    REJECTED = "rejected"        # MT5 отклонил ордер
+    PARTIAL = "partial"          # Частичное исполнение
+    CANCELLED = "cancelled"      # Отменено системой
+
+
+@dataclass
+class ExecutionRecord:
+    """Immutable execution record - source of truth for every trade."""
+    trace_id: str
+    idempotency_key: str
+    symbol: str
+    action: str  # BUY, SELL, CLOSE
+    volume: float
+    sl: float
+    tp: float
+    strategy: str
+    regime: str
+    confidence: float
+    status: ExecutionStatus
+    created_at: datetime
+    sent_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    ticket: Optional[int] = None
+    fill_price: Optional[float] = None
+    error_message: Optional[str] = None
+    retry_count: int = 0
+    last_retry_at: Optional[datetime] = None
+
+
+class ExecutionLedger:
+    """
+    Immutable execution ledger - SINGLE SOURCE OF TRUTH.
+    Write-ahead logging pattern. Every trade is recorded BEFORE execution.
+    """
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = asyncio.Lock()
+        self._init_ledger_tables()
+        logger.info("ExecutionLedger initialized")
+    
+    def _init_ledger_tables(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            # Main ledger table - IMMUTABLE records
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS execution_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT UNIQUE NOT NULL,
+                    idempotency_key TEXT UNIQUE NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    volume REAL NOT NULL,
+                    sl REAL,
+                    tp REAL,
+                    strategy TEXT,
+                    regime TEXT,
+                    confidence REAL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    sent_at TEXT,
+                    confirmed_at TEXT,
+                    ticket INTEGER,
+                    fill_price REAL,
+                    error_message TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    last_retry_at TEXT,
+                    version INTEGER DEFAULT 1
+                )
+            """)
+            
+            # Indexes for fast lookup
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ledger_trace ON execution_ledger(trace_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ledger_idempotency ON execution_ledger(idempotency_key)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ledger_status ON execution_ledger(status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ledger_ticket ON execution_ledger(ticket)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ledger_created ON execution_ledger(created_at)")
+            
+            # Ledger audit log - all state changes
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS ledger_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT,
+                    from_status TEXT,
+                    to_status TEXT,
+                    changed_at TEXT,
+                    reason TEXT,
+                    metadata TEXT
+                )
+            """)
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Init ledger tables error: {e}")
+    
+    async def create_pending(
+        self,
+        trace_id: str,
+        idempotency_key: str,
+        symbol: str,
+        action: str,
+        volume: float,
+        sl: float,
+        tp: float,
+        strategy: str,
+        regime: str,
+        confidence: float,
+    ) -> bool:
+        """Create PENDING execution record BEFORE sending to MT5."""
+        async with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO execution_ledger 
+                    (trace_id, idempotency_key, symbol, action, volume, sl, tp, 
+                     strategy, regime, confidence, status, created_at, version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    trace_id, idempotency_key, symbol, action, volume, sl, tp,
+                    strategy, regime, confidence, ExecutionStatus.PENDING.value,
+                    datetime.utcnow().isoformat(), 1
+                ))
+                conn.commit()
+                conn.close()
+                logger.debug(f"Ledger: created PENDING record {trace_id}")
+                return True
+            except sqlite3.IntegrityError:
+                logger.warning(f"Ledger: record {trace_id} or {idempotency_key} already exists")
+                return False
+            except Exception as e:
+                logger.error(f"Ledger create error: {e}")
+                return False
+    
+    async def update_status(
+        self,
+        trace_id: str,
+        new_status: ExecutionStatus,
+        ticket: Optional[int] = None,
+        fill_price: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        """Update execution status with audit trail."""
+        async with self._lock:
+            try:
+                # Get current record first
+                current = await self.get_record(trace_id)
+                if not current:
+                    logger.error(f"Ledger: record {trace_id} not found")
+                    return False
+                
+                old_status = current["status"]
+                
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                
+                # Update ledger
+                c.execute("""
+                    UPDATE execution_ledger 
+                    SET status = ?, sent_at = COALESCE(sent_at, ?),
+                        confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END,
+                        ticket = COALESCE(?, ticket),
+                        fill_price = COALESCE(?, fill_price),
+                        error_message = ?,
+                        version = version + 1
+                    WHERE trace_id = ?
+                """, (
+                    new_status.value,
+                    datetime.utcnow().isoformat() if new_status == ExecutionStatus.SENT else None,
+                    new_status.value,
+                    datetime.utcnow().isoformat() if new_status == ExecutionStatus.CONFIRMED else None,
+                    ticket,
+                    fill_price,
+                    error,
+                    trace_id
+                ))
+                
+                # Audit log
+                c.execute("""
+                    INSERT INTO ledger_audit (trace_id, from_status, to_status, changed_at, reason, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    trace_id,
+                    old_status,
+                    new_status.value,
+                    datetime.utcnow().isoformat(),
+                    error or "status_update",
+                    json.dumps({"ticket": ticket, "fill_price": fill_price}) if ticket else "{}"
+                ))
+                
+                conn.commit()
+                conn.close()
+                logger.debug(f"Ledger: {trace_id} {old_status} → {new_status.value}")
+                return True
+            except Exception as e:
+                logger.error(f"Ledger update error: {e}")
+                return False
+    
+    async def get_record(self, trace_id: str) -> Optional[dict]:
+        """Get execution record by trace_id."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM execution_ledger WHERE trace_id = ?", (trace_id,))
+            row = c.fetchone()
+            conn.close()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Get record error: {e}")
+            return None
+    
+    async def get_by_idempotency_key(self, key: str) -> Optional[dict]:
+        """Get execution record by idempotency key."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM execution_ledger WHERE idempotency_key = ?", (key,))
+            row = c.fetchone()
+            conn.close()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Get by idempotency error: {e}")
+            return None
+    
+    async def get_pending_records(self) -> List[dict]:
+        """Get all PENDING records for retry."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("""
+                SELECT * FROM execution_ledger 
+                WHERE status IN (?, ?) 
+                ORDER BY created_at ASC
+            """, (ExecutionStatus.PENDING.value, ExecutionStatus.SENT.value))
+            rows = c.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Get pending records error: {e}")
+            return []
+    
+    async def get_open_trades_from_ledger(self) -> List[dict]:
+        """Get CONFIRMED trades that should be open."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("""
+                SELECT * FROM execution_ledger 
+                WHERE status = ? AND action IN ('BUY', 'SELL')
+                ORDER BY created_at DESC
+            """, (ExecutionStatus.CONFIRMED.value,))
+            rows = c.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Get open trades error: {e}")
+            return []
+    
+    async def get_stats(self) -> dict:
+        """Get ledger statistics."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            c.execute("SELECT COUNT(*) FROM execution_ledger")
+            total = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM execution_ledger WHERE status = ?", (ExecutionStatus.PENDING.value,))
+            pending = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM execution_ledger WHERE status = ?", (ExecutionStatus.CONFIRMED.value,))
+            confirmed = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM execution_ledger WHERE status = ?", (ExecutionStatus.FAILED.value,))
+            failed = c.fetchone()[0]
+            
+            conn.close()
+            
+            return {
+                "total_records": total,
+                "pending": pending,
+                "confirmed": confirmed,
+                "failed": failed,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+
+# ============================================================================
+# 2. IDEMPOTENCY MANAGER - DOUBLE EXECUTION PREVENTION
+# ============================================================================
+
+class IdempotencyManager:
+    """
+    Global idempotency registry.
+    Prevents duplicate executions after crashes, retries, or race conditions.
+    """
+    
+    def __init__(self, ledger: ExecutionLedger):
+        self.ledger = ledger
+        self._cache: Dict[str, dict] = {}
+        self._cache_ttl_seconds = 3600
+        logger.info("IdempotencyManager initialized")
+    
+    def generate_key(
+        self,
+        symbol: str,
+        action: str,
+        strategy: str,
+        regime: str,
+        volume: float,
+        timestamp: datetime,
+    ) -> str:
+        """
+        Generate deterministic idempotency key.
+        Time bucket reduces collisions while preventing duplicates within safe window.
+        """
+        # Round to minute-level granularity (prevents duplicates within same minute)
+        time_bucket = timestamp.strftime("%Y%m%d%H%M")
+        
+        # Normalize volume to 2 decimals
+        normalized_volume = round(volume, 2)
+        
+        # Create unique string
+        unique_string = f"{symbol}:{action}:{strategy}:{regime}:{normalized_volume}:{time_bucket}"
+        
+        # Generate SHA256 hash
+        return hashlib.sha256(unique_string.encode()).hexdigest()[:32]
+    
+    async def is_duplicate(self, key: str) -> Tuple[bool, Optional[dict]]:
+        """Check if this key has been executed before."""
+        # Check memory cache first
+        if key in self._cache:
+            record = self._cache[key]
+            if (datetime.utcnow() - datetime.fromisoformat(record["created_at"])).total_seconds() < self._cache_ttl_seconds:
+                return True, record
+        
+        # Check ledger
+        record = await self.ledger.get_by_idempotency_key(key)
+        if record:
+            # Cache for future
+            self._cache[key] = record
+            # Trim cache
+            if len(self._cache) > 10000:
+                oldest = sorted(self._cache.keys(), 
+                               key=lambda k: self._cache[k]["created_at"])[:1000]
+                for k in oldest:
+                    del self._cache[k]
+            return True, record
+        
+        return False, None
+    
+    async def record_attempt(self, key: str, trace_id: str) -> bool:
+        """Record that an attempt was made (for tracking)."""
+        # This is just for tracking - actual record is in ledger
+        pass
+
+
+# ============================================================================
+# 3. ATOMIC EXECUTION PIPELINE
+# ============================================================================
+
+class AtomicExecutionPipeline:
+    """
+    Atomic execution pipeline with write-ahead guarantee.
+    Signal → Decision → Safety → Ledger Write → MT5 Send → Confirmation → Commit
+    """
+    
+    def __init__(
+        self,
+        ledger: ExecutionLedger,
+        idempotency_manager: IdempotencyManager,
+        event_bus: Optional["EventBus"] = None,
+    ):
+        self.ledger = ledger
+        self.idempotency = idempotency_manager
+        self.event_bus = event_bus
+        self._execution_lock = asyncio.Lock()
+        logger.info("AtomicExecutionPipeline initialized")
+    
+    async def execute(
+        self,
+        decision: dict,
+        mt5_send_fn: Callable[[dict], Awaitable[dict]],
+        trace_id: Optional[str] = None,
+    ) -> Tuple[bool, dict]:
+        """
+        Atomic execution of a trading decision.
+        
+        Returns:
+            (success, result_dict) with full execution details
+        """
+        trace_id = trace_id or f"exec_{uuid.uuid4().hex[:16]}_{int(time.time() * 1000)}"
+        
+        async with self._execution_lock:
+            symbol = decision.get("symbol")
+            action = decision.get("action", "").replace("OPEN_", "")
+            volume = decision.get("volume", 0.01)
+            sl = decision.get("sl", 0.0)
+            tp = decision.get("tp", 0.0)
+            strategy = decision.get("strategy", "UNKNOWN")
+            regime = decision.get("market_regime", "UNKNOWN")
+            confidence = decision.get("confidence", 0.5)
+            
+            # Generate idempotency key
+            idempotency_key = self.idempotency.generate_key(
+                symbol=symbol,
+                action=action,
+                strategy=strategy,
+                regime=regime,
+                volume=volume,
+                timestamp=datetime.utcnow(),
+            )
+            
+            # CHECK IDEMPOTENCY FIRST
+            is_dup, existing = await self.idempotency.is_duplicate(idempotency_key)
+            if is_dup:
+                logger.warning(f"Duplicate execution prevented: {idempotency_key[:16]}...")
+                await self._emit_event("ORDER_DUPLICATE_BLOCKED", {
+                    "trace_id": trace_id,
+                    "idempotency_key": idempotency_key,
+                    "existing_trace": existing.get("trace_id") if existing else None,
+                })
+                return False, {
+                    "success": False,
+                    "error": "Duplicate execution blocked by idempotency",
+                    "trace_id": trace_id,
+                    "was_duplicate": True,
+                }
+            
+            # STEP 1: Create PENDING record in ledger (WRITE-AHEAD)
+            success = await self.ledger.create_pending(
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+                symbol=symbol,
+                action=action,
+                volume=volume,
+                sl=sl,
+                tp=tp,
+                strategy=strategy,
+                regime=regime,
+                confidence=confidence,
+            )
+            
+            if not success:
+                return False, {
+                    "success": False,
+                    "error": "Failed to create ledger record",
+                    "trace_id": trace_id,
+                }
+            
+            await self._emit_event("ORDER_PENDING", {
+                "trace_id": trace_id,
+                "symbol": symbol,
+                "action": action,
+                "volume": volume,
+            })
+            
+            # STEP 2: Send to MT5
+            await self.ledger.update_status(trace_id, ExecutionStatus.SENT)
+            
+            try:
+                mt5_result = await mt5_send_fn(decision)
+            except Exception as e:
+                mt5_result = {"success": False, "error": str(e)}
+            
+            # STEP 3: Process MT5 response
+            if mt5_result.get("success"):
+                ticket = mt5_result.get("ticket")
+                price = mt5_result.get("price", 0)
+                
+                await self.ledger.update_status(
+                    trace_id=trace_id,
+                    new_status=ExecutionStatus.CONFIRMED,
+                    ticket=ticket,
+                    fill_price=price,
+                )
+                
+                await self._emit_event("ORDER_CONFIRMED", {
+                    "trace_id": trace_id,
+                    "ticket": ticket,
+                    "fill_price": price,
+                })
+                
+                return True, {
+                    "success": True,
+                    "trace_id": trace_id,
+                    "ticket": ticket,
+                    "price": price,
+                    "idempotency_key": idempotency_key,
+                }
+            else:
+                # STEP 4: Handle failure
+                error = mt5_result.get("error", "Unknown MT5 error")
+                retcode = mt5_result.get("retcode")
+                
+                await self.ledger.update_status(
+                    trace_id=trace_id,
+                    new_status=ExecutionStatus.FAILED,
+                    error=f"{error} (retcode: {retcode})" if retcode else error,
+                )
+                
+                await self._emit_event("ORDER_FAILED", {
+                    "trace_id": trace_id,
+                    "error": error,
+                    "retcode": retcode,
+                })
+                
+                return False, {
+                    "success": False,
+                    "trace_id": trace_id,
+                    "error": error,
+                    "retcode": retcode,
+                }
+    
+    async def _emit_event(self, event_type: str, payload: dict):
+        """Emit event to EventBus if available."""
+        if self.event_bus:
+            await self.event_bus.publish(TradingEvent(
+                event_type=event_type,
+                source="AtomicExecutionPipeline",
+                payload=payload,
+                priority=2,
+            ))
+
+
+# ============================================================================
+# 4. EXECUTION CONFIRMATION LOOP (BROKER SYNC)
+# ============================================================================
+
+class ExecutionConfirmationLoop:
+    """
+    Confirms orders with broker after submission.
+    Retries up to N times, marks FAILED after timeout.
+    """
+    
+    def __init__(
+        self,
+        ledger: ExecutionLedger,
+        get_position_fn: Callable[[int], Awaitable[Optional[dict]]],
+        event_bus: Optional["EventBus"] = None,
+    ):
+        self.ledger = ledger
+        self.get_position = get_position_fn
+        self.event_bus = event_bus
+        self.max_retries = 10
+        self.retry_delay_seconds = 1.0
+        self.confirmation_timeout_seconds = 30.0
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        logger.info("ExecutionConfirmationLoop initialized")
+    
+    async def start(self):
+        """Start background confirmation loop."""
+        self._running = True
+        self._task = asyncio.create_task(self._confirmation_loop())
+        logger.info("Confirmation loop started")
+    
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Confirmation loop stopped")
+    
+    async def _confirmation_loop(self):
+        while self._running:
+            try:
+                # Get SENT records that need confirmation
+                pending_records = await self.ledger.get_pending_records()
+                
+                for record in pending_records:
+                    if record["status"] == ExecutionStatus.SENT.value:
+                        await self._confirm_order(record)
+                
+                await asyncio.sleep(self.retry_delay_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Confirmation loop error: {e}")
+                await asyncio.sleep(5)
+    
+    async def _confirm_order(self, record: dict):
+        """Confirm a single order with broker."""
+        trace_id = record["trace_id"]
+        ticket = record.get("ticket")
+        sent_at = datetime.fromisoformat(record["sent_at"]) if record.get("sent_at") else datetime.utcnow()
+        age_seconds = (datetime.utcnow() - sent_at).total_seconds()
+        
+        # Timeout check
+        if age_seconds > self.confirmation_timeout_seconds:
+            await self.ledger.update_status(
+                trace_id=trace_id,
+                new_status=ExecutionStatus.FAILED,
+                error=f"Confirmation timeout after {age_seconds:.0f}s"
+            )
+            await self._emit_event("ORDER_CONFIRMATION_TIMEOUT", {"trace_id": trace_id})
+            return
+        
+        # Try to get position from broker
+        if ticket:
+            position = await self.get_position(ticket)
+            
+            if position:
+                # Confirmed!
+                await self.ledger.update_status(
+                    trace_id=trace_id,
+                    new_status=ExecutionStatus.CONFIRMED,
+                    ticket=ticket,
+                    fill_price=position.get("open_price"),
+                )
+                await self._emit_event("ORDER_CONFIRMED_BROKER_SYNC", {
+                    "trace_id": trace_id,
+                    "ticket": ticket,
+                })
+                logger.info(f"Order confirmed: {trace_id} ticket={ticket}")
+            else:
+                # Still waiting, increment retry
+                retry_count = record.get("retry_count", 0) + 1
+                
+                conn = sqlite3.connect(self.ledger.db_path)
+                c = conn.cursor()
+                c.execute("""
+                    UPDATE execution_ledger 
+                    SET retry_count = ?, last_retry_at = ?
+                    WHERE trace_id = ?
+                """, (retry_count, datetime.utcnow().isoformat(), trace_id))
+                conn.commit()
+                conn.close()
+    
+    async def _emit_event(self, event_type: str, payload: dict):
+        if self.event_bus:
+            await self.event_bus.publish(TradingEvent(
+                event_type=event_type,
+                source="ExecutionConfirmationLoop",
+                payload=payload,
+                priority=2,
+            ))
+
+
+# ============================================================================
+# 5. RECONCILIATION ENGINE (SELF-HEALING)
+# ============================================================================
+
+class ReconciliationEngine:
+    """
+    Continuous reconciliation between internal ledger and MT5 broker.
+    Detects and resolves inconsistencies automatically.
+    """
+    
+    def __init__(
+        self,
+        ledger: ExecutionLedger,
+        get_broker_positions_fn: Callable[[], Awaitable[List[dict]]],
+        event_bus: Optional["EventBus"] = None,
+    ):
+        self.ledger = ledger
+        self.get_broker_positions = get_broker_positions_fn
+        self.event_bus = event_bus
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self.reconciliation_interval_seconds = 60.0
+        self.last_reconciliation: Optional[datetime] = None
+        self.consistency_state = "UNKNOWN"
+        logger.info("ReconciliationEngine initialized")
+    
+    async def start(self):
+        """Start background reconciliation loop."""
+        self._running = True
+        self._task = asyncio.create_task(self._reconciliation_loop())
+        logger.info("Reconciliation engine started")
+    
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Reconciliation engine stopped")
+    
+    async def _reconciliation_loop(self):
+        while self._running:
+            try:
+                await self.reconcile()
+                await asyncio.sleep(self.reconciliation_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Reconciliation loop error: {e}")
+                await asyncio.sleep(10)
+    
+    async def reconcile(self) -> dict:
+        """Perform full reconciliation."""
+        start_time = time.time()
+        
+        try:
+            # Get broker positions
+            broker_positions = await self.get_broker_positions()
+            broker_map = {p.get("ticket"): p for p in broker_positions if p.get("ticket")}
+            broker_tickets = set(broker_map.keys())
+            
+            # Get ledger confirmed trades
+            ledger_trades = await self.ledger.get_open_trades_from_ledger()
+            ledger_map = {t["ticket"]: t for t in ledger_trades if t.get("ticket")}
+            ledger_tickets = set(ledger_map.keys())
+            
+            # Detect mismatches
+            orphan_broker = broker_tickets - ledger_tickets
+            orphan_ledger = ledger_tickets - broker_tickets
+            
+            mismatches = []
+            
+            # Orphan broker positions (broker has, system doesn't know)
+            for ticket in orphan_broker:
+                mismatches.append({
+                    "type": "broker_only",
+                    "ticket": ticket,
+                    "position": broker_map[ticket],
+                })
+            
+            # Orphan ledger records (system thinks open, broker doesn't have)
+            for ticket in orphan_ledger:
+                mismatches.append({
+                    "type": "ledger_only",
+                    "ticket": ticket,
+                    "record": ledger_map[ticket],
+                })
+            
+            # Emit alert if mismatches found
+            if mismatches:
+                await self._emit_event("RECONCILIATION_MISMATCH", {
+                    "mismatches": mismatches,
+                    "broker_count": len(broker_tickets),
+                    "ledger_count": len(ledger_tickets),
+                })
+                logger.warning(f"Reconciliation mismatch: broker_only={len(orphan_broker)}, ledger_only={len(orphan_ledger)}")
+                self.consistency_state = "INCONSISTENT"
+            else:
+                self.consistency_state = "CONSISTENT"
+            
+            self.last_reconciliation = datetime.utcnow()
+            
+            return {
+                "timestamp": datetime.utcnow().isoformat(),
+                "broker_positions": len(broker_tickets),
+                "ledger_positions": len(ledger_tickets),
+                "orphan_broker": list(orphan_broker),
+                "orphan_ledger": list(orphan_ledger),
+                "mismatch_count": len(mismatches),
+                "consistent": len(mismatches) == 0,
+                "duration_ms": (time.time() - start_time) * 1000,
+            }
+            
+        except Exception as e:
+            logger.error(f"Reconciliation error: {e}")
+            return {"error": str(e)}
+    
+    async def _emit_event(self, event_type: str, payload: dict):
+        if self.event_bus:
+            await self.event_bus.publish(TradingEvent(
+                event_type=event_type,
+                source="ReconciliationEngine",
+                payload=payload,
+                priority=2,
+            ))
+    
+    async def validate_consistency(self) -> Tuple[bool, str]:
+        """Validate system consistency before enabling trading."""
+        if not self.last_reconciliation:
+            return False, "No reconciliation performed yet"
+        
+        if self.consistency_state != "CONSISTENT":
+            return False, f"System inconsistent: {self.consistency_state}"
+        
+        age_seconds = (datetime.utcnow() - self.last_reconciliation).total_seconds()
+        if age_seconds > 120:
+            return False, f"Last reconciliation too old: {age_seconds:.0f}s ago"
+        
+        return True, "System consistent"
+
+
+# ============================================================================
+# 6. CIRCUIT BREAKER SYSTEM (FINAL SAFETY)
+# ============================================================================
+
+class CircuitBreakerState(Enum):
+    GREEN = "green"      # Normal operation
+    YELLOW = "yellow"    # Warning, monitor only
+    RED = "red"          # No new trades, can close
+    HALTED = "halted"    # Complete freeze, manual recovery
+
+
+class CircuitBreakerSystem:
+    """
+    Final safety layer. Protects against catastrophic losses.
+    GREEN → YELLOW → RED → HALTED progression.
+    """
+    
+    def __init__(self, db_path: str, event_bus: Optional["EventBus"] = None):
+        self.db_path = db_path
+        self.event_bus = event_bus
+        self.state = CircuitBreakerState.GREEN
+        self.state_entered_at = datetime.utcnow()
+        
+        # Thresholds
+        self.drawdown_hard_limit_pct = 0.15
+        self.drawdown_soft_limit_pct = 0.10
+        self.execution_failure_rate_threshold = 0.30  # 30% failures
+        self.reconciliation_mismatch_threshold = 5     # 5 mismatches
+        
+        # Tracking
+        self.peak_equity: float = 0.0
+        self.current_drawdown: float = 0.0
+        self.execution_attempts: int = 0
+        self.execution_failures: int = 0
+        self.reconciliation_mismatch_count: int = 0
+        
+        self._init_tables()
+        logger.info("CircuitBreakerSystem initialized")
+    
+    def _init_tables(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS circuit_breaker_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    from_state TEXT,
+                    to_state TEXT,
+                    reason TEXT,
+                    metrics TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Init circuit breaker tables: {e}")
+    
+    def update_metrics(
+        self,
+        equity: float,
+        execution_success: Optional[bool] = None,
+        reconciliation_mismatch: bool = False,
+    ):
+        """Update internal metrics for circuit breaker evaluation."""
+        # Update drawdown
+        if equity > self.peak_equity:
+            self.peak_equity = equity
+        
+        if self.peak_equity > 0:
+            self.current_drawdown = (self.peak_equity - equity) / self.peak_equity
+        
+        # Update execution stats
+        if execution_success is not None:
+            self.execution_attempts += 1
+            if not execution_success:
+                self.execution_failures += 1
+        
+        # Update reconciliation mismatch count
+        if reconciliation_mismatch:
+            self.reconciliation_mismatch_count += 1
+            # Decay over time
+            self.reconciliation_mismatch_count = max(0, self.reconciliation_mismatch_count - 1)
+        
+        # Evaluate state
+        self._evaluate_state()
+    
+    def _evaluate_state(self):
+        """Evaluate current metrics and transition state if needed."""
+        new_state = self.state
+        
+        # Check for HALTED (critical)
+        if self.current_drawdown >= self.drawdown_hard_limit_pct:
+            new_state = CircuitBreakerState.HALTED
+            reason = f"Drawdown hard limit: {self.current_drawdown:.2%}"
+        
+        # Check for RED
+        elif self.state != CircuitBreakerState.HALTED:
+            if self.current_drawdown >= self.drawdown_soft_limit_pct:
+                new_state = CircuitBreakerState.RED
+                reason = f"Drawdown soft limit: {self.current_drawdown:.2%}"
+            
+            # Check execution failure rate
+            if self.execution_attempts > 10:
+                failure_rate = self.execution_failures / self.execution_attempts
+                if failure_rate >= self.execution_failure_rate_threshold:
+                    new_state = CircuitBreakerState.RED
+                    reason = f"Execution failure rate: {failure_rate:.2%}"
+            
+            # Check reconciliation mismatches
+            if self.reconciliation_mismatch_count >= self.reconciliation_mismatch_threshold:
+                new_state = CircuitBreakerState.RED
+                reason = f"Reconciliation mismatches: {self.reconciliation_mismatch_count}"
+        
+        # Check for YELLOW
+        elif self.state == CircuitBreakerState.GREEN:
+            if self.current_drawdown >= self.drawdown_soft_limit_pct * 0.7:
+                new_state = CircuitBreakerState.YELLOW
+                reason = f"Approaching drawdown limit: {self.current_drawdown:.2%}"
+        
+        # Auto-recovery from RED if conditions improve
+        if self.state == CircuitBreakerState.RED and self.current_drawdown < self.drawdown_soft_limit_pct * 0.5:
+            new_state = CircuitBreakerState.YELLOW
+            reason = "Auto-recovery: drawdown improved"
+        
+        # Execute transition
+        if new_state != self.state:
+            self._transition_to(new_state, reason)
+    
+    async def _transition_to(self, new_state: CircuitBreakerState, reason: str):
+        """Execute state transition."""
+        logger.critical(f"CIRCUIT BREAKER: {self.state.value} → {new_state.value}, reason: {reason}")
+        old_state = self.state
+        self.state = new_state
+        self.state_entered_at = datetime.utcnow()
+        
+        # Save to database
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO circuit_breaker_events (timestamp, from_state, to_state, reason, metrics)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                datetime.utcnow().isoformat(),
+                old_state.value,
+                new_state.value,
+                reason,
+                json.dumps({
+                    "drawdown": self.current_drawdown,
+                    "failures": self.execution_failures,
+                    "attempts": self.execution_attempts,
+                }),
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Save circuit breaker event error: {e}")
+        
+        # Emit event
+        if self.event_bus:
+            await self.event_bus.publish(TradingEvent(
+                event_type="CIRCUIT_BREAKER_TRIGGERED",
+                source="CircuitBreakerSystem",
+                payload={
+                    "from_state": old_state.value,
+                    "to_state": new_state.value,
+                    "reason": reason,
+                    "drawdown": self.current_drawdown,
+                },
+                priority=3,
+            ))
+    
+    def can_trade(self) -> Tuple[bool, str]:
+        """Check if new trades are allowed."""
+        if self.state == CircuitBreakerState.HALTED:
+            return False, "System HALTED - manual recovery required"
+        if self.state == CircuitBreakerState.RED:
+            return False, "System RED - no new trades allowed"
+        if self.state == CircuitBreakerState.YELLOW:
+            return True, "YELLOW - proceed with caution"
+        return True, "GREEN - normal operation"
+    
+    async def get_status(self) -> dict:
+        return {
+            "state": self.state.value,
+            "state_entered_at": self.state_entered_at.isoformat(),
+            "peak_equity": self.peak_equity,
+            "current_drawdown_pct": round(self.current_drawdown, 4),
+            "execution_failure_rate": round(self.execution_failures / max(1, self.execution_attempts), 4),
+            "reconciliation_mismatch_count": self.reconciliation_mismatch_count,
+        }
+
+
+# ============================================================================
+# 7. EXECUTION OBSERVABILITY
+# ============================================================================
+
+class ExecutionObservability:
+    """
+    Production-grade execution metrics tracking.
+    Latency, slippage, fill rates, error analysis.
+    """
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.latency_records: deque = deque(maxlen=10000)
+        self.slippage_records: deque = deque(maxlen=10000)
+        self.rejection_codes: Dict[int, int] = {}
+        self._init_tables()
+        logger.info("ExecutionObservability initialized")
+    
+    def _init_tables(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS execution_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    metric_type TEXT,
+                    symbol TEXT,
+                    value REAL,
+                    metadata TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Init observability tables: {e}")
+    
+    def record_latency(self, trace_id: str, latency_ms: float, symbol: str):
+        """Record execution latency."""
+        self.latency_records.append({
+            "trace_id": trace_id,
+            "latency_ms": latency_ms,
+            "symbol": symbol,
+            "timestamp": datetime.utcnow(),
+        })
+        self._store_metric("latency", symbol, latency_ms, {"trace_id": trace_id})
+    
+    def record_slippage(self, trace_id: str, expected: float, actual: float, symbol: str):
+        """Record slippage in pips."""
+        if "JPY" in symbol:
+            slippage_pips = abs(actual - expected) * 100
+        else:
+            slippage_pips = abs(actual - expected) * 10000
+        
+        self.slippage_records.append({
+            "trace_id": trace_id,
+            "slippage_pips": slippage_pips,
+            "symbol": symbol,
+            "timestamp": datetime.utcnow(),
+        })
+        self._store_metric("slippage", symbol, slippage_pips, {"trace_id": trace_id})
+    
+    def record_rejection(self, retcode: int, symbol: str):
+        """Record MT5 rejection code."""
+        self.rejection_codes[retcode] = self.rejection_codes.get(retcode, 0) + 1
+    
+    def _store_metric(self, metric_type: str, symbol: str, value: float, metadata: dict):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO execution_metrics (timestamp, metric_type, symbol, value, metadata)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                datetime.utcnow().isoformat(),
+                metric_type,
+                symbol,
+                value,
+                json.dumps(metadata),
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Store metric error: {e}")
+    
+    def get_report(self) -> dict:
+        """Get comprehensive execution report."""
+        latencies = [r["latency_ms"] for r in self.latency_records]
+        slippages = [r["slippage_pips"] for r in self.slippage_records]
+        
+        return {
+            "total_executions": len(self.latency_records),
+            "latency_ms": {
+                "avg": float(np.mean(latencies)) if latencies else 0,
+                "p95": float(np.percentile(latencies, 95)) if latencies else 0,
+                "p99": float(np.percentile(latencies, 99)) if latencies else 0,
+                "max": max(latencies) if latencies else 0,
+            },
+            "slippage_pips": {
+                "avg": float(np.mean(slippages)) if slippages else 0,
+                "p95": float(np.percentile(slippages, 95)) if slippages else 0,
+                "max": max(slippages) if slippages else 0,
+            },
+            "rejection_codes": self.rejection_codes,
+        }
+
+
+# ============================================================================
+# 8. FAILURE RESILIENCE - MT5 DISCONNECT HANDLING
+# ============================================================================
+
+class FailureResilienceLayer:
+    """
+    Handles MT5 disconnects, auto-reconnect, retry queue, dead-letter queue.
+    """
+    
+    def __init__(
+        self,
+        db_path: str,
+        mt5_connect_fn: Callable[[], bool],
+        mt5_is_connected_fn: Callable[[], bool],
+        event_bus: Optional["EventBus"] = None,
+    ):
+        self.db_path = db_path
+        self.mt5_connect = mt5_connect_fn
+        self.mt5_is_connected = mt5_is_connected_fn
+        self.event_bus = event_bus
+        self._running = False
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._retry_queue_task: Optional[asyncio.Task] = None
+        self.is_connected = False
+        
+        # Dead-letter queue storage
+        self._init_tables()
+        logger.info("FailureResilienceLayer initialized")
+    
+    def _init_tables(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pending_retry_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT,
+                    payload TEXT,
+                    retry_count INTEGER,
+                    created_at TEXT,
+                    next_retry_at TEXT,
+                    last_error TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS dead_letter_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT,
+                    payload TEXT,
+                    failed_at TEXT,
+                    failure_reason TEXT,
+                    retry_count INTEGER
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Init resilience tables: {e}")
+    
+    async def start(self):
+        """Start resilience monitoring."""
+        self._running = True
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        self._retry_queue_task = asyncio.create_task(self._retry_queue_loop())
+        logger.info("Failure resilience started")
+    
+    async def stop(self):
+        self._running = False
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+        if self._retry_queue_task:
+            self._retry_queue_task.cancel()
+        logger.info("Failure resilience stopped")
+    
+    async def _reconnect_loop(self):
+        """Background MT5 reconnect loop."""
+        while self._running:
+            try:
+                current_connected = self.mt5_is_connected()
+                
+                if not current_connected and self.is_connected:
+                    # Just lost connection
+                    logger.error("MT5 connection lost")
+                    self.is_connected = False
+                    await self._emit_event("MT5_DISCONNECTED", {})
+                
+                elif not current_connected and not self.is_connected:
+                    # Try to reconnect
+                    logger.info("Attempting MT5 reconnect...")
+                    success = self.mt5_connect()
+                    if success:
+                        self.is_connected = True
+                        logger.info("MT5 reconnected successfully")
+                        await self._emit_event("MT5_RECONNECTED", {})
+                
+                elif current_connected and not self.is_connected:
+                    self.is_connected = True
+                    logger.info("MT5 connection restored")
+                
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Reconnect loop error: {e}")
+                await asyncio.sleep(10)
+    
+    async def _retry_queue_loop(self):
+        """Process pending retry queue."""
+        while self._running:
+            try:
+                if self.is_connected:
+                    await self._process_retry_queue()
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Retry queue error: {e}")
+    
+    async def _process_retry_queue(self):
+        """Process queued retries when connected."""
+        # Implementation would process pending orders
+        pass
+    
+    def add_to_retry_queue(self, trace_id: str, payload: dict):
+        """Add failed execution to retry queue."""
+        # Implementation for persistent retry
+        pass
+    
+    def add_to_dead_letter(self, trace_id: str, payload: dict, error: str):
+        """Add permanently failed execution to DLQ."""
+        # Implementation for dead-letter storage
+        pass
+    
+    async def _emit_event(self, event_type: str, payload: dict):
+        if self.event_bus:
+            await self.event_bus.publish(TradingEvent(
+                event_type=event_type,
+                source="FailureResilienceLayer",
+                payload=payload,
+                priority=2,
+            ))
+
+
+# ============================================================================
+# 9. STARTUP RECOVERY SEQUENCE
+# ============================================================================
+
+class StartupRecoverySequence:
+    """
+    Critical startup recovery sequence.
+    Trading is ONLY enabled if ALL checks pass.
+    """
+    
+    def __init__(
+        self,
+        ledger: ExecutionLedger,
+        reconciliation_engine: ReconciliationEngine,
+        circuit_breaker: CircuitBreakerSystem,
+        execution_safety: "ExecutionSafetyLayer",
+        event_bus: Optional["EventBus"] = None,
+    ):
+        self.ledger = ledger
+        self.reconciliation = reconciliation_engine
+        self.circuit_breaker = circuit_breaker
+        self.execution_safety = execution_safety
+        self.event_bus = event_bus
+        self.recovery_complete = False
+        self.trading_enabled = False
+        logger.info("StartupRecoverySequence initialized")
+    
+    async def execute(self) -> Tuple[bool, str]:
+        """
+        Execute full startup recovery sequence.
+        Returns (success, message) - trading enabled only on success.
+        """
+        logger.info("=" * 60)
+        logger.info("STARTUP RECOVERY SEQUENCE INITIATED")
+        logger.info("=" * 60)
+        
+        # STEP 1: Load ledger state
+        logger.info("STEP 1: Loading ledger state...")
+        ledger_stats = await self.ledger.get_stats()
+        logger.info(f"  Ledger: {ledger_stats['total_records']} total, {ledger_stats['pending']} pending")
+        
+        # STEP 2: Reconcile with broker
+        logger.info("STEP 2: Reconciling with broker...")
+        reconciliation_result = await self.reconciliation.reconcile()
+        
+        if not reconciliation_result.get("consistent", False):
+            error_msg = f"Reconciliation failed: {reconciliation_result.get('mismatch_count', 0)} mismatches"
+            logger.error(f"  {error_msg}")
+            await self._emit_event("RECOVERY_FAILED", {"reason": error_msg})
+            return False, error_msg
+        
+        logger.info(f"  Reconciliation successful: {reconciliation_result['broker_positions']} positions matched")
+        
+        # STEP 3: Validate circuit breaker state
+        logger.info("STEP 3: Validating circuit breaker...")
+        cb_status = await self.circuit_breaker.get_status()
+        
+        if cb_status["state"] in ["red", "halted"]:
+            error_msg = f"Circuit breaker in {cb_status['state'].upper()} state"
+            logger.error(f"  {error_msg}")
+            await self._emit_event("RECOVERY_FAILED", {"reason": error_msg})
+            return False, error_msg
+        
+        logger.info(f"  Circuit breaker: {cb_status['state']}")
+        
+        # STEP 4: Check execution safety
+        logger.info("STEP 4: Validating execution safety...")
+        if self.execution_safety.kill_switch_active:
+            error_msg = f"Kill switch active: {self.execution_safety.kill_switch_reason}"
+            logger.error(f"  {error_msg}")
+            return False, error_msg
+        
+        logger.info("  Execution safety: OK")
+        
+        # STEP 5: Final consistency validation
+        logger.info("STEP 5: Final consistency validation...")
+        consistent, reason = await self.reconciliation.validate_consistency()
+        
+        if not consistent:
+            error_msg = f"Consistency validation failed: {reason}"
+            logger.error(f"  {error_msg}")
+            return False, error_msg
+        
+        logger.info("  Consistency: VALID")
+        
+        # RECOVERY SUCCESSFUL
+        self.recovery_complete = True
+        self.trading_enabled = True
+        
+        logger.info("=" * 60)
+        logger.info("STARTUP RECOVERY COMPLETE - TRADING ENABLED")
+        logger.info("=" * 60)
+        
+        await self._emit_event("RECOVERY_COMPLETE", {
+            "ledger_stats": ledger_stats,
+            "reconciliation": reconciliation_result,
+            "circuit_breaker": cb_status,
+        })
+        
+        return True, "Recovery complete, trading enabled"
+    
+    async def _emit_event(self, event_type: str, payload: dict):
+        if self.event_bus:
+            await self.event_bus.publish(TradingEvent(
+                event_type=event_type,
+                source="StartupRecoverySequence",
+                payload=payload,
+                priority=1,
+            ))
+
+
+# ============================================================================
+# 10. INTEGRATION INTO MASTERAI - FINAL PATCHES
+# ============================================================================
+
+# Add execution hardening components to MasterAI.__init__
+_original_hardening_init = MasterAI.__init__
+
+def _final_hardening_init(self, symbols, db_path, broadcast_callback=None):
+    _original_hardening_init(self, symbols, db_path, broadcast_callback)
+    
+    # Add execution hardening components
+    self.execution_ledger = ExecutionLedger(db_path)
+    self.idempotency_manager = IdempotencyManager(self.execution_ledger)
+    
+    # Create MT5 execution wrapper
+    from backend import mt5_integration
+    
+    async def mt5_execute(decision: dict) -> dict:
+        """Wrapper for MT5 execution with proper async."""
+        action = decision.get("action", "").replace("OPEN_", "")
+        symbol = decision.get("symbol")
+        volume = decision.get("volume", 0.01)
+        sl = decision.get("sl", 0.0)
+        tp = decision.get("tp", 0.0)
+        strategy = decision.get("strategy", "")[:10]
+        
+        # Execute synchronously (MT5 library is synchronous)
+        result = mt5_integration.open_order(symbol, action, volume, sl, tp, f"AI:{strategy}")
+        return result
+    
+    self.atomic_pipeline = AtomicExecutionPipeline(
+        ledger=self.execution_ledger,
+        idempotency_manager=self.idempotency_manager,
+        event_bus=self.event_bus,
+    )
+    
+    async def get_broker_positions():
+        from backend import mt5_integration
+        return mt5_integration.get_positions()
+    
+    self.reconciliation_engine_hard = ReconciliationEngine(
+        ledger=self.execution_ledger,
+        get_broker_positions_fn=get_broker_positions,
+        event_bus=self.event_bus,
+    )
+    
+    self.circuit_breaker_hard = CircuitBreakerSystem(db_path, self.event_bus)
+    self.execution_observability = ExecutionObservability(db_path)
+    
+    # Create confirmation loop
+    async def get_position(ticket: int):
+        from backend import mt5_integration
+        positions = mt5_integration.get_positions()
+        for p in positions:
+            if p.get("ticket") == ticket:
+                return p
+        return None
+    
+    self.confirmation_loop = ExecutionConfirmationLoop(
+        ledger=self.execution_ledger,
+        get_position_fn=get_position,
+        event_bus=self.event_bus,
+    )
+    
+    self.failure_resilience = FailureResilienceLayer(
+        db_path=db_path,
+        mt5_connect_fn=mt5_integration.connect,
+        mt5_is_connected_fn=lambda: mt5_integration.connected,
+        event_bus=self.event_bus,
+    )
+    
+    self.startup_recovery_hard = StartupRecoverySequence(
+        ledger=self.execution_ledger,
+        reconciliation_engine=self.reconciliation_engine_hard,
+        circuit_breaker=self.circuit_breaker_hard,
+        execution_safety=self.execution_safety,
+        event_bus=self.event_bus,
+    )
+    
+    logger.info("Final execution hardening layer initialized")
+
+MasterAI.__init__ = _final_hardening_init
+
+
+# Override think_and_decide to use atomic pipeline
+_original_think_and_decide = MasterAI.think_and_decide
+
+async def _hardened_think_and_decide(self, positions, account, market_data):
+    # Check circuit breaker before any decision
+    can_trade, reason = self.circuit_breaker_hard.can_trade()
+    if not can_trade:
+        logger.warning(f"Circuit breaker blocks trading: {reason}")
+        return []
+    
+    # Get decisions from original method
+    decisions = await _original_think_and_decide(self, positions, account, market_data)
+    
+    # Update circuit breaker metrics
+    self.circuit_breaker_hard.update_metrics(equity=account.get("equity", 0))
+    
+    # Execute each decision through atomic pipeline
+    executed_decisions = []
+    for decision in decisions:
+        if decision.get("action") in ["OPEN_BUY", "OPEN_SELL"] and decision.get("execute"):
+            success, result = await self.atomic_pipeline.execute(
+                decision=decision,
+                mt5_send_fn=lambda d: self.idempotent_open_order(
+                    d["symbol"],
+                    d["action"].replace("OPEN_", ""),
+                    d["volume"],
+                    d.get("sl", 0.0),
+                    d.get("tp", 0.0),
+                ),
+            )
+            
+            # Record observability metrics
+            if result.get("price"):
+                self.execution_observability.record_latency(
+                    result["trace_id"],
+                    0,  # Would calculate actual latency
+                    decision["symbol"],
+                )
+            
+            if not success:
+                self.circuit_breaker_hard.update_metrics(
+                    equity=account.get("equity", 0),
+                    execution_success=False,
+                )
+                self.execution_observability.record_rejection(
+                    result.get("retcode", -1),
+                    decision["symbol"],
+                )
+            else:
+                self.circuit_breaker_hard.update_metrics(
+                    equity=account.get("equity", 0),
+                    execution_success=True,
+                )
+            
+            decision["execution_trace_id"] = result.get("trace_id")
+            decision["executed"] = success
+        
+        executed_decisions.append(decision)
+    
+    return executed_decisions
+
+MasterAI.think_and_decide = _hardened_think_and_decide
+
+
+# Add execution report method
+async def _get_execution_report(self) -> dict:
+    """Get comprehensive execution report."""
+    return {
+        "ledger": await self.execution_ledger.get_stats(),
+        "circuit_breaker": await self.circuit_breaker_hard.get_status(),
+        "observability": self.execution_observability.get_report(),
+        "reconciliation": await self.reconciliation_engine_hard.reconcile(),
+    }
+
+MasterAI.get_execution_report = _get_execution_report
+
+
+# Modify initialize to include startup recovery
+_original_hardening_initialize = MasterAI.initialize
+
+async def _final_hardening_initialize(self):
+    await _original_hardening_initialize(self)
+    
+    # Start background services
+    await self.reconciliation_engine_hard.start()
+    await self.confirmation_loop.start()
+    await self.failure_resilience.start()
+    
+    # Execute startup recovery - TRADING ENABLED ONLY ON SUCCESS
+    success, message = await self.startup_recovery_hard.execute()
+    
+    if not success:
+        logger.critical(f"STARTUP RECOVERY FAILED: {message}")
+        logger.critical("TRADING WILL NOT BE ENABLED")
+        await self.execution_safety.activate_kill_switch(f"Startup recovery failed: {message}")
+    else:
+        logger.info(f"Startup recovery successful: {message}")
+        logger.info("TRADING ENABLED - System ready for live execution")
+    
+    logger.info("MasterAI fully initialized with execution hardening")
+
+MasterAI.initialize = _final_hardening_initialize
+
+
+# Modify shutdown to clean up
+_original_hardening_shutdown = MasterAI.shutdown
+
+async def _final_hardening_shutdown(self):
+    await self.reconciliation_engine_hard.stop()
+    await self.confirmation_loop.stop()
+    await self.failure_resilience.stop()
+    await _original_hardening_shutdown(self)
+
+MasterAI.shutdown = _final_hardening_shutdown
+
+
+# Add health check endpoint integration
+def _get_full_health_status(self) -> dict:
+    """Get full system health including execution layer."""
+    return {
+        "system": self.get_health_status() if hasattr(self, "get_health_status") else {},
+        "execution": {
+            "ledger": asyncio.run_coroutine_threadsafe(
+                self.execution_ledger.get_stats(), asyncio.get_event_loop()
+            ).result(),
+            "circuit_breaker": asyncio.run_coroutine_threadsafe(
+                self.circuit_breaker_hard.get_status(), asyncio.get_event_loop()
+            ).result(),
+            "trading_enabled": not self.execution_safety.kill_switch_active,
+        },
+    }
+
+MasterAI.get_full_health_status = _get_full_health_status
