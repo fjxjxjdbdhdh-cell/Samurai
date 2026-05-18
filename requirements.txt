@@ -5553,3 +5553,1596 @@ class MasterAI:
             except asyncio.CancelledError:
                 pass
         logger.info("MasterAI shutdown complete")
+# ============================================================================
+# PRODUCTION RELIABILITY LAYER
+# Add this code to the END of ai_core.py
+# ============================================================================
+
+import hashlib
+import json
+import sqlite3
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any, Callable, Set
+from collections import deque
+import uuid
+import time
+
+# ============================================================================
+# 1. RECONCILIATION ENGINE
+# ============================================================================
+
+class ConsistencyStatus(Enum):
+    """Consistency status between broker and internal state."""
+    CONSISTENT = "consistent"
+    BROKER_HAS_EXTRA = "broker_has_extra"
+    INTERNAL_HAS_EXTRA = "internal_has_extra"
+    VOLUME_MISMATCH = "volume_mismatch"
+    PRICE_MISMATCH = "price_mismatch"
+    CRITICAL_ERROR = "critical_error"
+
+
+@dataclass
+class PositionReconciliationResult:
+    """Result of reconciling a single position."""
+    ticket: int
+    symbol: str
+    broker_exists: bool
+    internal_exists: bool
+    broker_volume: float
+    internal_volume: float
+    broker_open_price: float
+    internal_open_price: float
+    broker_sl: float
+    internal_sl: float
+    broker_tp: float
+    internal_tp: float
+    status: ConsistencyStatus
+    resolution_action: Optional[str] = None
+    resolved: bool = False
+
+
+@dataclass
+class ReconciliationReport:
+    """Full reconciliation report."""
+    timestamp: datetime
+    total_broker_positions: int
+    total_internal_positions: int
+    matched_positions: int
+    orphan_broker_positions: List[int]
+    orphan_internal_positions: List[int]
+    mismatches: List[PositionReconciliationResult]
+    repairs_performed: List[str]
+    consistency_achieved: bool
+    requires_manual_intervention: bool
+    duration_ms: float
+
+
+class ReconciliationEngine:
+    """
+    Production-grade reconciliation engine.
+    Synchronizes internal state with MT5 broker.
+    Critical for ensuring system-broker consistency.
+    """
+    
+    def __init__(self, db_path: str, event_bus: Optional["EventBus"] = None):
+        self.db_path = db_path
+        self.event_bus = event_bus
+        self._lock = asyncio.Lock()
+        self.reconciliation_history: deque = deque(maxlen=100)
+        self.last_reconciliation: Optional[datetime] = None
+        self.consistency_status: ConsistencyStatus = ConsistencyStatus.CONSISTENT
+        
+        self._init_reconciliation_tables()
+        logger.info("ReconciliationEngine initialized")
+    
+    def _init_reconciliation_tables(self):
+        """Create reconciliation tracking tables."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS reconciliation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    total_broker INTEGER,
+                    total_internal INTEGER,
+                    matched INTEGER,
+                    orphan_broker TEXT,
+                    orphan_internal TEXT,
+                    repairs TEXT,
+                    consistent INTEGER,
+                    duration_ms REAL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS position_snapshot (
+                    ticket INTEGER PRIMARY KEY,
+                    symbol TEXT,
+                    volume REAL,
+                    open_price REAL,
+                    sl REAL,
+                    tp REAL,
+                    snapshot_time TEXT,
+                    source TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS reconciliation_repair_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    ticket INTEGER,
+                    action TEXT,
+                    reason TEXT,
+                    success INTEGER
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Init reconciliation tables error: {e}")
+    
+    async def take_broker_snapshot(self, get_broker_positions_fn: Callable) -> Dict[int, dict]:
+        """Take a snapshot of current broker positions."""
+        try:
+            positions = await get_broker_positions_fn() if asyncio.iscoroutinefunction(get_broker_positions_fn) else get_broker_positions_fn()
+            snapshot = {}
+            for pos in positions:
+                ticket = pos.get("ticket")
+                if ticket:
+                    snapshot[ticket] = {
+                        "ticket": ticket,
+                        "symbol": pos.get("symbol"),
+                        "volume": pos.get("volume", 0.0),
+                        "open_price": pos.get("open_price", 0.0),
+                        "sl": pos.get("sl", 0.0),
+                        "tp": pos.get("tp", 0.0),
+                        "order_type": pos.get("order_type"),
+                        "profit": pos.get("profit", 0.0),
+                    }
+            
+            # Save snapshot to DB
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            for ticket, data in snapshot.items():
+                c.execute("""
+                    INSERT OR REPLACE INTO position_snapshot (ticket, symbol, volume, open_price, sl, tp, snapshot_time, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (ticket, data.get("symbol"), data.get("volume"), data.get("open_price"),
+                      data.get("sl"), data.get("tp"), datetime.utcnow().isoformat(), "broker"))
+            conn.commit()
+            conn.close()
+            
+            return snapshot
+        except Exception as e:
+            logger.error(f"Take broker snapshot error: {e}")
+            return {}
+    
+    async def take_internal_snapshot(self, get_internal_positions_fn: Callable) -> Dict[int, dict]:
+        """Take a snapshot of current internal positions from DB."""
+        try:
+            positions = await get_internal_positions_fn() if asyncio.iscoroutinefunction(get_internal_positions_fn) else get_internal_positions_fn()
+            snapshot = {}
+            for pos in positions:
+                ticket = pos.get("ticket")
+                if ticket:
+                    snapshot[ticket] = {
+                        "ticket": ticket,
+                        "symbol": pos.get("symbol"),
+                        "volume": pos.get("volume", 0.0),
+                        "open_price": pos.get("open_price", 0.0),
+                        "sl": pos.get("sl", 0.0),
+                        "tp": pos.get("tp", 0.0),
+                        "order_type": pos.get("order_type"),
+                        "profit": pos.get("profit", 0.0),
+                    }
+            
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            for ticket, data in snapshot.items():
+                c.execute("""
+                    INSERT OR REPLACE INTO position_snapshot (ticket, symbol, volume, open_price, sl, tp, snapshot_time, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (ticket, data.get("symbol"), data.get("volume"), data.get("open_price"),
+                      data.get("sl"), data.get("tp"), datetime.utcnow().isoformat(), "internal"))
+            conn.commit()
+            conn.close()
+            
+            return snapshot
+        except Exception as e:
+            logger.error(f"Take internal snapshot error: {e}")
+            return {}
+    
+    async def reconcile(
+        self,
+        broker_positions: List[dict],
+        internal_positions: List[dict],
+        auto_repair: bool = True,
+    ) -> ReconciliationReport:
+        """
+        Perform full reconciliation between broker and internal state.
+        
+        Args:
+            broker_positions: Positions from MT5
+            internal_positions: Positions from internal DB
+            auto_repair: If True, attempt automatic repair of discrepancies
+        
+        Returns:
+            ReconciliationReport with full details
+        """
+        start_time = time.time()
+        
+        async with self._lock:
+            broker_map = {p["ticket"]: p for p in broker_positions if p.get("ticket")}
+            internal_map = {p["ticket"]: p for p in internal_positions if p.get("ticket")}
+            
+            broker_tickets = set(broker_map.keys())
+            internal_tickets = set(internal_map.keys())
+            
+            orphan_broker = list(broker_tickets - internal_tickets)
+            orphan_internal = list(internal_tickets - broker_tickets)
+            common_tickets = broker_tickets & internal_tickets
+            
+            mismatches = []
+            repairs_performed = []
+            
+            # Check common positions for mismatches
+            for ticket in common_tickets:
+                broker = broker_map[ticket]
+                internal = internal_map[ticket]
+                mismatch = self._compare_positions(ticket, broker, internal)
+                if mismatch.status != ConsistencyStatus.CONSISTENT:
+                    mismatches.append(mismatch)
+                    if auto_repair:
+                        repair_result = await self._attempt_repair(mismatch, broker, internal)
+                        if repair_result:
+                            repairs_performed.append(repair_result)
+                            mismatch.resolved = True
+                            mismatch.resolution_action = repair_result
+            
+            # Determine overall consistency
+            consistent = len(orphan_broker) == 0 and len(orphan_internal) == 0 and len(mismatches) == 0
+            requires_manual = len(orphan_broker) > 0 or len([m for m in mismatches if not m.resolved]) > 0
+            
+            if consistent:
+                self.consistency_status = ConsistencyStatus.CONSISTENT
+            elif orphan_broker:
+                self.consistency_status = ConsistencyStatus.BROKER_HAS_EXTRA
+            elif orphan_internal:
+                self.consistency_status = ConsistencyStatus.INTERNAL_HAS_EXTRA
+            elif mismatches:
+                self.consistency_status = ConsistencyStatus.VOLUME_MISMATCH
+            
+            report = ReconciliationReport(
+                timestamp=datetime.utcnow(),
+                total_broker_positions=len(broker_tickets),
+                total_internal_positions=len(internal_tickets),
+                matched_positions=len(common_tickets),
+                orphan_broker_positions=orphan_broker,
+                orphan_internal_positions=orphan_internal,
+                mismatches=mismatches,
+                repairs_performed=repairs_performed,
+                consistency_achieved=consistent,
+                requires_manual_intervention=requires_manual,
+                duration_ms=(time.time() - start_time) * 1000,
+            )
+            
+            # Store history
+            self.reconciliation_history.append(report)
+            self.last_reconciliation = report.timestamp
+            
+            # Save to DB
+            self._save_reconciliation_report(report)
+            
+            # Emit event if inconsistency detected
+            if not consistent and self.event_bus:
+                await self.event_bus.publish(TradingEvent(
+                    event_type="reconciliation_issue",
+                    source="ReconciliationEngine",
+                    payload={
+                        "orphan_broker": orphan_broker,
+                        "orphan_internal": orphan_internal,
+                        "mismatches": len(mismatches),
+                        "requires_manual": requires_manual,
+                    },
+                    priority=2,
+                ))
+            
+            logger.info(
+                f"Reconciliation completed: broker={len(broker_tickets)}, "
+                f"internal={len(internal_tickets)}, matched={len(common_tickets)}, "
+                f"orphan_broker={len(orphan_broker)}, orphan_internal={len(orphan_internal)}, "
+                f"mismatches={len(mismatches)}, consistent={consistent}, duration={report.duration_ms:.0f}ms"
+            )
+            
+            return report
+    
+    def _compare_positions(self, ticket: int, broker: dict, internal: dict) -> PositionReconciliationResult:
+        """Compare broker and internal position details."""
+        status = ConsistencyStatus.CONSISTENT
+        
+        # Check volume mismatch (allow 0.01 tolerance)
+        if abs(broker.get("volume", 0) - internal.get("volume", 0)) > 0.009:
+            status = ConsistencyStatus.VOLUME_MISMATCH
+        
+        # Check price mismatch (allow 0.5 pip tolerance)
+        price_tolerance = 0.00005 if "JPY" not in broker.get("symbol", "") else 0.05
+        if abs(broker.get("open_price", 0) - internal.get("open_price", 0)) > price_tolerance:
+            status = ConsistencyStatus.PRICE_MISMATCH
+        
+        return PositionReconciliationResult(
+            ticket=ticket,
+            symbol=broker.get("symbol", ""),
+            broker_exists=True,
+            internal_exists=True,
+            broker_volume=broker.get("volume", 0),
+            internal_volume=internal.get("volume", 0),
+            broker_open_price=broker.get("open_price", 0),
+            internal_open_price=internal.get("open_price", 0),
+            broker_sl=broker.get("sl", 0),
+            internal_sl=internal.get("sl", 0),
+            broker_tp=broker.get("tp", 0),
+            internal_tp=internal.get("tp", 0),
+            status=status,
+        )
+    
+    async def _attempt_repair(self, mismatch: PositionReconciliationResult, broker: dict, internal: dict) -> Optional[str]:
+        """Attempt to automatically repair a mismatch."""
+        try:
+            if mismatch.status == ConsistencyStatus.VOLUME_MISMATCH:
+                # Volume mismatch - internal should be updated to match broker
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                c.execute(
+                    "UPDATE trades SET volume = ? WHERE ticket = ?",
+                    (broker.get("volume", 0), mismatch.ticket)
+                )
+                conn.commit()
+                conn.close()
+                
+                self._log_repair(mismatch.ticket, "UPDATE_VOLUME", 
+                                f"Volume corrected from {mismatch.internal_volume} to {mismatch.broker_volume}", True)
+                return f"VOLUME_CORRECTED:{mismatch.ticket}"
+            
+            elif mismatch.status == ConsistencyStatus.PRICE_MISMATCH:
+                # Price mismatch - log but don't auto-repair (broker is source of truth)
+                self._log_repair(mismatch.ticket, "PRICE_MISMATCH_LOG", 
+                                f"Price diff: broker={mismatch.broker_open_price}, internal={mismatch.internal_open_price}", True)
+                return f"PRICE_MISMATCH_LOGGED:{mismatch.ticket}"
+            
+            return None
+        except Exception as e:
+            logger.error(f"Repair attempt failed for ticket {mismatch.ticket}: {e}")
+            self._log_repair(mismatch.ticket, "REPAIR_FAILED", str(e), False)
+            return None
+    
+    def _log_repair(self, ticket: int, action: str, reason: str, success: bool):
+        """Log repair action to database."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO reconciliation_repair_log (timestamp, ticket, action, reason, success)
+                VALUES (?, ?, ?, ?, ?)
+            """, (datetime.utcnow().isoformat(), ticket, action, reason, 1 if success else 0))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Log repair error: {e}")
+    
+    def _save_reconciliation_report(self, report: ReconciliationReport):
+        """Save reconciliation report to database."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO reconciliation_history 
+                (timestamp, total_broker, total_internal, matched, orphan_broker, orphan_internal, repairs, consistent, duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                report.timestamp.isoformat(),
+                report.total_broker_positions,
+                report.total_internal_positions,
+                report.matched_positions,
+                json.dumps(report.orphan_broker_positions),
+                json.dumps(report.orphan_internal_positions),
+                json.dumps(report.repairs_performed),
+                1 if report.consistency_achieved else 0,
+                report.duration_ms,
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Save reconciliation report error: {e}")
+    
+    async def validate_consistency(self) -> Tuple[bool, str]:
+        """
+        Quick consistency validation before enabling trading.
+        Returns (is_consistent, reason).
+        """
+        if not self.last_reconciliation:
+            return False, "No reconciliation performed yet"
+        
+        if self.consistency_status != ConsistencyStatus.CONSISTENT:
+            return False, f"System inconsistent: {self.consistency_status.value}"
+        
+        # Check if last reconciliation is too old (> 5 minutes)
+        if self.last_reconciliation and (datetime.utcnow() - self.last_reconciliation).total_seconds() > 300:
+            return False, "Last reconciliation is stale (> 5 minutes)"
+        
+        return True, "System consistent"
+    
+    def get_last_report(self) -> Optional[ReconciliationReport]:
+        """Get the most recent reconciliation report."""
+        if self.reconciliation_history:
+            return self.reconciliation_history[-1]
+        return None
+
+
+# ============================================================================
+# 2. EVENT DURABILITY LAYER
+# ============================================================================
+
+class EventDeliveryStatus(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
+
+
+@dataclass
+class DurableEvent:
+    """Persistent event with delivery tracking."""
+    event_id: str
+    event_type: str
+    source: str
+    payload: Dict[str, Any]
+    created_at: datetime
+    status: EventDeliveryStatus
+    retry_count: int = 0
+    last_attempt: Optional[datetime] = None
+    last_error: Optional[str] = None
+    next_retry_at: Optional[datetime] = None
+
+
+class EventDurabilityLayer:
+    """
+    Production-grade durable event queue.
+    Provides at-least-once delivery with retries and dead-letter queue.
+    """
+    
+    def __init__(self, db_path: str, event_bus: Optional["EventBus"] = None):
+        self.db_path = db_path
+        self.event_bus = event_bus
+        self._processing = False
+        self._processor_task: Optional[asyncio.Task] = None
+        
+        # Retry configuration
+        self.base_retry_delay_seconds: float = 1.0
+        self.max_retry_delay_seconds: float = 300.0
+        self.max_retry_count: int = 5
+        self.batch_size: int = 50
+        self.processing_interval_seconds: float = 1.0
+        
+        self._init_durability_tables()
+        logger.info("EventDurabilityLayer initialized")
+    
+    def _init_durability_tables(self):
+        """Create durable event tables."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS durable_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT UNIQUE,
+                    event_type TEXT,
+                    source TEXT,
+                    payload TEXT,
+                    created_at TEXT,
+                    status TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    last_attempt TEXT,
+                    last_error TEXT,
+                    next_retry_at TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS dead_letter_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT,
+                    event_type TEXT,
+                    source TEXT,
+                    payload TEXT,
+                    failed_at TEXT,
+                    failure_reason TEXT,
+                    retry_count INTEGER
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_durable_events_status ON durable_events(status, next_retry_at)
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Init durability tables error: {e}")
+    
+    async def publish_durable(self, event: TradingEvent) -> str:
+        """
+        Publish an event with durability guarantee.
+        Returns event_id.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO durable_events 
+                (event_id, event_type, source, payload, created_at, status, retry_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event.event_id,
+                event.event_type,
+                event.source,
+                json.dumps(event.payload, default=str),
+                event.timestamp,
+                EventDeliveryStatus.PENDING.value,
+                0,
+            ))
+            conn.commit()
+            conn.close()
+            
+            logger.debug(f"Durable event published: {event.event_id} ({event.event_type})")
+            return event.event_id
+            
+        except sqlite3.IntegrityError:
+            logger.warning(f"Event {event.event_id} already exists, skipping")
+            return event.event_id
+        except Exception as e:
+            logger.error(f"Publish durable event error: {e}")
+            raise
+    
+    async def start_processor(self, handler_fn: Callable[[TradingEvent], Awaitable[bool]]):
+        """
+        Start the background processor that consumes durable events.
+        
+        Args:
+            handler_fn: Async function that takes TradingEvent and returns bool (success/failure)
+        """
+        self._processing = True
+        self._processor_task = asyncio.create_task(self._process_loop(handler_fn))
+        logger.info("Event durability processor started")
+    
+    async def stop_processor(self):
+        """Stop the background processor."""
+        self._processing = False
+        if self._processor_task and not self._processor_task.done():
+            self._processor_task.cancel()
+            try:
+                await self._processor_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Event durability processor stopped")
+    
+    async def _process_loop(self, handler_fn: Callable[[TradingEvent], Awaitable[bool]]):
+        """Main processing loop for durable events."""
+        while self._processing:
+            try:
+                # Get pending events ready for retry
+                events = await self._get_pending_events()
+                
+                for event_data in events:
+                    if not self._processing:
+                        break
+                    
+                    event = self._deserialize_event(event_data)
+                    
+                    # Mark as processing
+                    await self._update_event_status(event.event_id, EventDeliveryStatus.PROCESSING)
+                    
+                    try:
+                        success = await handler_fn(event)
+                        
+                        if success:
+                            await self._mark_completed(event.event_id)
+                            logger.debug(f"Durable event processed: {event.event_id}")
+                        else:
+                            await self._handle_failure(event, "Handler returned False")
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing durable event {event.event_id}: {e}")
+                        await self._handle_failure(event, str(e))
+                
+                await asyncio.sleep(self.processing_interval_seconds)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Event durability processor loop error: {e}")
+                await asyncio.sleep(5.0)
+    
+    async def _get_pending_events(self) -> List[dict]:
+        """Get pending events that are ready for processing."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            now = datetime.utcnow().isoformat()
+            c.execute("""
+                SELECT * FROM durable_events 
+                WHERE status = ? 
+                AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (EventDeliveryStatus.PENDING.value, now, self.batch_size))
+            
+            rows = c.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            logger.error(f"Get pending events error: {e}")
+            return []
+    
+    async def _update_event_status(self, event_id: str, status: EventDeliveryStatus):
+        """Update event status."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                UPDATE durable_events 
+                SET status = ?, last_attempt = ?
+                WHERE event_id = ?
+            """, (status.value, datetime.utcnow().isoformat(), event_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Update event status error: {e}")
+    
+    async def _mark_completed(self, event_id: str):
+        """Mark event as completed and remove from queue."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                DELETE FROM durable_events WHERE event_id = ?
+            """, (event_id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Mark completed error: {e}")
+    
+    async def _handle_failure(self, event: DurableEvent, error: str):
+        """Handle event processing failure with retry logic."""
+        new_retry_count = event.retry_count + 1
+        
+        if new_retry_count >= self.max_retry_count:
+            # Move to dead-letter queue
+            await self._move_to_dlq(event, error)
+            await self._delete_event(event.event_id)
+            logger.warning(f"Event {event.event_id} moved to DLQ after {new_retry_count} retries")
+        else:
+            # Calculate next retry time with exponential backoff
+            delay = min(
+                self.base_retry_delay_seconds * (2 ** (new_retry_count - 1)),
+                self.max_retry_delay_seconds
+            )
+            next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
+            
+            try:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                c.execute("""
+                    UPDATE durable_events 
+                    SET status = ?, retry_count = ?, last_error = ?, next_retry_at = ?
+                    WHERE event_id = ?
+                """, (
+                    EventDeliveryStatus.PENDING.value,
+                    new_retry_count,
+                    error[:500],
+                    next_retry_at.isoformat(),
+                    event.event_id,
+                ))
+                conn.commit()
+                conn.close()
+                logger.debug(f"Event {event.event_id} scheduled for retry in {delay}s (attempt {new_retry_count})")
+            except Exception as e:
+                logger.error(f"Handle failure update error: {e}")
+    
+    async def _move_to_dlq(self, event: DurableEvent, error: str):
+        """Move failed event to dead-letter queue."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO dead_letter_queue 
+                (event_id, event_type, source, payload, failed_at, failure_reason, retry_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event.event_id,
+                event.event_type,
+                event.source,
+                json.dumps(event.payload, default=str),
+                datetime.utcnow().isoformat(),
+                error[:500],
+                event.retry_count,
+            ))
+            conn.commit()
+            conn.close()
+            
+            if self.event_bus:
+                await self.event_bus.publish(TradingEvent(
+                    event_type="dead_letter_event",
+                    source="EventDurabilityLayer",
+                    payload={
+                        "event_id": event.event_id,
+                        "event_type": event.event_type,
+                        "failure_reason": error,
+                    },
+                    priority=2,
+                ))
+        except Exception as e:
+            logger.error(f"Move to DLQ error: {e}")
+    
+    async def _delete_event(self, event_id: str):
+        """Delete event from durable queue."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("DELETE FROM durable_events WHERE event_id = ?", (event_id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Delete event error: {e}")
+    
+    def _deserialize_event(self, event_data: dict) -> DurableEvent:
+        """Deserialize database row to DurableEvent."""
+        return DurableEvent(
+            event_id=event_data["event_id"],
+            event_type=event_data["event_type"],
+            source=event_data["source"],
+            payload=json.loads(event_data["payload"]),
+            created_at=datetime.fromisoformat(event_data["created_at"]),
+            status=EventDeliveryStatus(event_data["status"]),
+            retry_count=event_data["retry_count"],
+            last_attempt=datetime.fromisoformat(event_data["last_attempt"]) if event_data.get("last_attempt") else None,
+            last_error=event_data.get("last_error"),
+            next_retry_at=datetime.fromisoformat(event_data["next_retry_at"]) if event_data.get("next_retry_at") else None,
+        )
+    
+    async def replay_dead_letter(self, event_id: Optional[str] = None) -> int:
+        """
+        Replay events from dead-letter queue.
+        Returns number of events replayed.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            if event_id:
+                c.execute("SELECT * FROM dead_letter_queue WHERE event_id = ?", (event_id,))
+            else:
+                c.execute("SELECT * FROM dead_letter_queue ORDER BY failed_at ASC")
+            
+            rows = c.fetchall()
+            conn.close()
+            
+            replayed = 0
+            for row in rows:
+                # Re-insert into durable queue
+                conn2 = sqlite3.connect(self.db_path)
+                c2 = conn2.cursor()
+                try:
+                    c2.execute("""
+                        INSERT INTO durable_events 
+                        (event_id, event_type, source, payload, created_at, status, retry_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        row[1], row[2], row[3], row[4],
+                        datetime.utcnow().isoformat(),
+                        EventDeliveryStatus.PENDING.value,
+                        0,
+                    ))
+                    c2.execute("DELETE FROM dead_letter_queue WHERE event_id = ?", (row[1],))
+                    conn2.commit()
+                    replayed += 1
+                except sqlite3.IntegrityError:
+                    logger.warning(f"Event {row[1]} already in queue, skipping")
+                finally:
+                    conn2.close()
+            
+            logger.info(f"Replayed {replayed} events from DLQ")
+            return replayed
+            
+        except Exception as e:
+            logger.error(f"Replay dead letter error: {e}")
+            return 0
+    
+    async def get_stats(self) -> dict:
+        """Get queue statistics."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            c.execute("SELECT COUNT(*) FROM durable_events WHERE status = ?", (EventDeliveryStatus.PENDING.value,))
+            pending = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM durable_events WHERE status = ?", (EventDeliveryStatus.PROCESSING.value,))
+            processing = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM dead_letter_queue")
+            dead_letter = c.fetchone()[0]
+            
+            conn.close()
+            
+            return {
+                "pending_events": pending,
+                "processing_events": processing,
+                "dead_letter_count": dead_letter,
+                "max_retry_count": self.max_retry_count,
+                "processor_running": self._processing,
+            }
+        except Exception as e:
+            logger.error(f"Get stats error: {e}")
+            return {"error": str(e)}
+
+
+# ============================================================================
+# 3. IDEMPOTENCY LAYER
+# ============================================================================
+
+@dataclass
+class IdempotencyRecord:
+    """Record of an idempotent operation."""
+    idempotency_key: str
+    operation_type: str
+    symbol: str
+    parameters: Dict[str, Any]
+    result: Dict[str, Any]
+    created_at: datetime
+    executed_at: datetime
+    success: bool
+
+
+class IdempotencyLayer:
+    """
+    Idempotency layer for trade executions.
+    Prevents duplicate orders after crashes or network issues.
+    """
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._cache: Dict[str, IdempotencyRecord] = {}
+        self._cache_ttl_seconds: int = 3600  # 1 hour cache
+        self._cleanup_interval_seconds: int = 300  # 5 minutes
+        
+        self._init_idempotency_tables()
+        self._start_cleanup_task()
+        logger.info("IdempotencyLayer initialized")
+    
+    def _init_idempotency_tables(self):
+        """Create idempotency tables."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS idempotency_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT UNIQUE,
+                    operation_type TEXT,
+                    symbol TEXT,
+                    parameters TEXT,
+                    result TEXT,
+                    created_at TEXT,
+                    executed_at TEXT,
+                    success INTEGER
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_idempotency_key ON idempotency_records(idempotency_key)
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_records(created_at)
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Init idempotency tables error: {e}")
+    
+    def generate_key(self, operation_type: str, symbol: str, params: Dict[str, Any]) -> str:
+        """
+        Generate an idempotency key for an operation.
+        Deterministic based on operation characteristics.
+        """
+        # Normalize params (sort keys, convert to string)
+        normalized_params = json.dumps(params, sort_keys=True, default=str)
+        
+        # Create unique string
+        unique_string = f"{operation_type}:{symbol}:{normalized_params}"
+        
+        # Add timestamp window (minute-level granularity to prevent duplicates within same minute)
+        # This allows natural retries within the same minute to be deduplicated
+        timestamp_window = datetime.utcnow().strftime("%Y%m%d%H%M")
+        unique_string_with_time = f"{unique_string}:{timestamp_window}"
+        
+        # Generate SHA256 hash
+        return hashlib.sha256(unique_string_with_time.encode()).hexdigest()[:32]
+    
+    async def check_and_store(
+        self,
+        idempotency_key: str,
+        operation_type: str,
+        symbol: str,
+        parameters: Dict[str, Any],
+        executor: Callable[[], Awaitable[Dict[str, Any]]],
+    ) -> Tuple[Dict[str, Any], bool]:
+        """
+        Execute operation with idempotency guarantee.
+        
+        Returns:
+            (result, was_cached) - result and whether it came from cache
+        """
+        # Check cache first
+        cached = await self._get_cached_result(idempotency_key)
+        if cached:
+            logger.info(f"Idempotency cache hit for key {idempotency_key[:8]}...")
+            return cached, True
+        
+        # Check database for existing execution
+        existing = await self._get_existing_record(idempotency_key)
+        if existing:
+            logger.info(f"Idempotency DB hit for key {idempotency_key[:8]}...")
+            await self._cache_record(existing)
+            return existing.result, True
+        
+        # Execute fresh
+        try:
+            result = await executor()
+            success = result.get("success", False)
+            
+            record = IdempotencyRecord(
+                idempotency_key=idempotency_key,
+                operation_type=operation_type,
+                symbol=symbol,
+                parameters=parameters,
+                result=result,
+                created_at=datetime.utcnow(),
+                executed_at=datetime.utcnow(),
+                success=success,
+            )
+            
+            await self._save_record(record)
+            await self._cache_record(record)
+            
+            logger.info(f"Idempotency fresh execution for key {idempotency_key[:8]}: success={success}")
+            return result, False
+            
+        except Exception as e:
+            logger.error(f"Idempotency execution error: {e}")
+            raise
+    
+    async def _get_cached_result(self, key: str) -> Optional[Dict[str, Any]]:
+        """Get result from in-memory cache."""
+        record = self._cache.get(key)
+        if record:
+            # Check TTL
+            age = (datetime.utcnow() - record.executed_at).total_seconds()
+            if age < self._cache_ttl_seconds:
+                return record.result
+            else:
+                # Expired, remove from cache
+                del self._cache[key]
+        return None
+    
+    async def _get_existing_record(self, key: str) -> Optional[IdempotencyRecord]:
+        """Get existing record from database."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute(
+                "SELECT operation_type, symbol, parameters, result, created_at, executed_at, success "
+                "FROM idempotency_records WHERE idempotency_key = ?",
+                (key,)
+            )
+            row = c.fetchone()
+            conn.close()
+            
+            if row:
+                return IdempotencyRecord(
+                    idempotency_key=key,
+                    operation_type=row[0],
+                    symbol=row[1],
+                    parameters=json.loads(row[2]),
+                    result=json.loads(row[3]),
+                    created_at=datetime.fromisoformat(row[4]),
+                    executed_at=datetime.fromisoformat(row[5]),
+                    success=bool(row[6]),
+                )
+            return None
+        except Exception as e:
+            logger.error(f"Get existing record error: {e}")
+            return None
+    
+    async def _save_record(self, record: IdempotencyRecord):
+        """Save record to database."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO idempotency_records 
+                (idempotency_key, operation_type, symbol, parameters, result, created_at, executed_at, success)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record.idempotency_key,
+                record.operation_type,
+                record.symbol,
+                json.dumps(record.parameters, default=str),
+                json.dumps(record.result, default=str),
+                record.created_at.isoformat(),
+                record.executed_at.isoformat(),
+                1 if record.success else 0,
+            ))
+            conn.commit()
+            conn.close()
+        except sqlite3.IntegrityError:
+            logger.warning(f"Record {record.idempotency_key} already exists, skipping")
+        except Exception as e:
+            logger.error(f"Save record error: {e}")
+    
+    async def _cache_record(self, record: IdempotencyRecord):
+        """Cache record in memory."""
+        self._cache[record.idempotency_key] = record
+        
+        # Trim cache if too large
+        if len(self._cache) > 10000:
+            # Remove oldest entries
+            oldest_keys = sorted(self._cache.keys(), 
+                                key=lambda k: self._cache[k].executed_at)[:1000]
+            for key in oldest_keys:
+                del self._cache[key]
+    
+    def _start_cleanup_task(self):
+        """Start background cleanup task for old records."""
+        asyncio.create_task(self._cleanup_loop())
+    
+    async def _cleanup_loop(self):
+        """Background cleanup of old idempotency records."""
+        while True:
+            try:
+                await asyncio.sleep(self._cleanup_interval_seconds)
+                
+                # Delete records older than 7 days
+                cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+                
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                c.execute("DELETE FROM idempotency_records WHERE created_at < ?", (cutoff,))
+                deleted = c.rowcount
+                conn.commit()
+                conn.close()
+                
+                if deleted > 0:
+                    logger.debug(f"Cleaned up {deleted} old idempotency records")
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Idempotency cleanup error: {e}")
+    
+    async def get_stats(self) -> dict:
+        """Get idempotency layer statistics."""
+        return {
+            "cache_size": len(self._cache),
+            "cache_ttl_seconds": self._cache_ttl_seconds,
+        }
+
+
+# ============================================================================
+# 4. STARTUP RECOVERY SEQUENCE
+# ============================================================================
+
+class StartupRecoverySequence:
+    """
+    Orchestrates the complete startup recovery process.
+    Ensures system consistency before trading is enabled.
+    """
+    
+    def __init__(
+        self,
+        persistence_layer: PersistenceLayer,
+        reconciliation_engine: ReconciliationEngine,
+        event_durability: EventDurabilityLayer,
+        idempotency_layer: IdempotencyLayer,
+        execution_safety: ExecutionSafetyLayer,
+        event_bus: EventBus,
+    ):
+        self.persistence = persistence_layer
+        self.reconciliation = reconciliation_engine
+        self.event_durability = event_durability
+        self.idempotency = idempotency_layer
+        self.execution_safety = execution_safety
+        self.event_bus = event_bus
+        
+        self.recovery_status: Dict[str, Any] = {}
+        self.trading_enabled: bool = False
+        self.recovery_complete: bool = False
+    
+    async def execute_recovery(
+        self,
+        master_ai: "MasterAI",
+        get_broker_positions_fn: Callable,
+        get_internal_positions_fn: Callable,
+    ) -> Tuple[bool, str]:
+        """
+        Execute full startup recovery sequence.
+        
+        Returns:
+            (success, message) - whether recovery succeeded and trading can be enabled
+        """
+        logger.info("=" * 60)
+        logger.info("STARTING PRODUCTION RECOVERY SEQUENCE")
+        logger.info("=" * 60)
+        
+        start_time = datetime.utcnow()
+        self.recovery_status = {
+            "started_at": start_time.isoformat(),
+            "steps": {},
+        }
+        
+        # Step 1: Load persisted state
+        step1_ok = await self._step1_load_state(master_ai)
+        if not step1_ok:
+            return False, "Failed to load persisted state"
+        
+        # Step 2: Reconcile with broker
+        step2_ok, step2_msg = await self._step2_reconcile_broker(
+            get_broker_positions_fn, get_internal_positions_fn
+        )
+        if not step2_ok:
+            return False, f"Reconciliation failed: {step2_msg}"
+        
+        # Step 3: Replay critical events
+        step3_ok = await self._step3_replay_events()
+        if not step3_ok:
+            return False, "Failed to replay events"
+        
+        # Step 4: Validate system consistency
+        step4_ok, step4_msg = await self._step4_validate_consistency()
+        if not step4_ok:
+            return False, f"Consistency validation failed: {step4_msg}"
+        
+        # Step 5: Enable trading
+        await self._step5_enable_trading()
+        
+        # Record completion
+        self.recovery_complete = True
+        duration = (datetime.utcnow() - start_time).total_seconds()
+        self.recovery_status["completed_at"] = datetime.utcnow().isoformat()
+        self.recovery_status["duration_seconds"] = duration
+        self.recovery_status["trading_enabled"] = self.trading_enabled
+        
+        logger.info("=" * 60)
+        logger.info(f"RECOVERY COMPLETE: duration={duration:.2f}s, trading_enabled={self.trading_enabled}")
+        logger.info("=" * 60)
+        
+        # Emit recovery complete event
+        await self.event_bus.publish(TradingEvent(
+            event_type="recovery_complete",
+            source="StartupRecoverySequence",
+            payload={
+                "duration_seconds": duration,
+                "trading_enabled": self.trading_enabled,
+                "status": self.recovery_status,
+            },
+            priority=1,
+        ))
+        
+        return self.trading_enabled, "Recovery successful, trading enabled" if self.trading_enabled else "Recovery completed but trading not enabled"
+    
+    async def _step1_load_state(self, master_ai: "MasterAI") -> bool:
+        """Step 1: Load persisted state from database."""
+        logger.info("STEP 1: Loading persisted state...")
+        
+        try:
+            load_results = await self.persistence.load_all(master_ai)
+            self.recovery_status["steps"]["load_state"] = {
+                "status": "success",
+                "results": {k: v for k, v in load_results.items()},
+            }
+            logger.info(f"Step 1 complete: loaded {len(load_results)} components")
+            return True
+        except Exception as e:
+            logger.error(f"Step 1 failed: {e}")
+            self.recovery_status["steps"]["load_state"] = {
+                "status": "failed",
+                "error": str(e),
+            }
+            return False
+    
+    async def _step2_reconcile_broker(
+        self,
+        get_broker_positions_fn: Callable,
+        get_internal_positions_fn: Callable,
+    ) -> Tuple[bool, str]:
+        """Step 2: Reconcile with broker positions."""
+        logger.info("STEP 2: Reconciling with broker...")
+        
+        try:
+            # Get positions
+            if asyncio.iscoroutinefunction(get_broker_positions_fn):
+                broker_positions = await get_broker_positions_fn()
+            else:
+                broker_positions = get_broker_positions_fn()
+            
+            if asyncio.iscoroutinefunction(get_internal_positions_fn):
+                internal_positions = await get_internal_positions_fn()
+            else:
+                internal_positions = get_internal_positions_fn()
+            
+            # Perform reconciliation
+            report = await self.reconciliation.reconcile(
+                broker_positions=broker_positions,
+                internal_positions=internal_positions,
+                auto_repair=True,
+            )
+            
+            self.recovery_status["steps"]["reconcile"] = {
+                "status": "success" if report.consistency_achieved else "warning",
+                "broker_positions": report.total_broker_positions,
+                "internal_positions": report.total_internal_positions,
+                "matched": report.matched_positions,
+                "orphan_broker": len(report.orphan_broker_positions),
+                "orphan_internal": len(report.orphan_internal_positions),
+                "mismatches": len(report.mismatches),
+                "repairs": len(report.repairs_performed),
+                "requires_manual": report.requires_manual_intervention,
+            }
+            
+            if report.requires_manual_intervention:
+                logger.warning(f"Step 2 complete with manual intervention required: {len(report.orphan_broker_positions)} orphans")
+                return False, f"Manual intervention required: orphan positions exist"
+            
+            if not report.consistency_achieved:
+                logger.warning(f"Step 2 complete with inconsistencies: {len(report.mismatches)} mismatches")
+                return False, f"Inconsistencies detected: {len(report.mismatches)} mismatches"
+            
+            logger.info("Step 2 complete: system consistent with broker")
+            return True, "OK"
+            
+        except Exception as e:
+            logger.error(f"Step 2 failed: {e}")
+            self.recovery_status["steps"]["reconcile"] = {
+                "status": "failed",
+                "error": str(e),
+            }
+            return False, str(e)
+    
+    async def _step3_replay_events(self) -> bool:
+        """Step 3: Replay critical events from dead-letter queue."""
+        logger.info("STEP 3: Replaying critical events...")
+        
+        try:
+            replayed = await self.event_durability.replay_dead_letter()
+            self.recovery_status["steps"]["replay_events"] = {
+                "status": "success",
+                "replayed_count": replayed,
+            }
+            logger.info(f"Step 3 complete: replayed {replayed} events")
+            return True
+        except Exception as e:
+            logger.error(f"Step 3 failed: {e}")
+            self.recovery_status["steps"]["replay_events"] = {
+                "status": "failed",
+                "error": str(e),
+            }
+            return False
+    
+    async def _step4_validate_consistency(self) -> Tuple[bool, str]:
+        """Step 4: Validate overall system consistency."""
+        logger.info("STEP 4: Validating system consistency...")
+        
+        try:
+            # Check reconciliation consistency
+            rec_consistent, rec_reason = await self.reconciliation.validate_consistency()
+            if not rec_consistent:
+                return False, f"Reconciliation: {rec_reason}"
+            
+            # Check execution safety status
+            if self.execution_safety.kill_switch_active:
+                return False, f"Kill switch active: {self.execution_safety.kill_switch_reason}"
+            
+            # Check for blocked symbols
+            if self.execution_safety.blocked_symbols:
+                logger.warning(f"Blocked symbols exist: {self.execution_safety.blocked_symbols}")
+            
+            self.recovery_status["steps"]["validate"] = {
+                "status": "success",
+                "checks": {
+                    "reconciliation": rec_consistent,
+                    "kill_switch": not self.execution_safety.kill_switch_active,
+                },
+            }
+            
+            logger.info("Step 4 complete: all consistency checks passed")
+            return True, "OK"
+            
+        except Exception as e:
+            logger.error(f"Step 4 failed: {e}")
+            self.recovery_status["steps"]["validate"] = {
+                "status": "failed",
+                "error": str(e),
+            }
+            return False, str(e)
+    
+    async def _step5_enable_trading(self):
+        """Step 5: Enable trading (kill-switch deactivation)."""
+        logger.info("STEP 5: Enabling trading...")
+        
+        try:
+            # Deactivate kill switch if active
+            if self.execution_safety.kill_switch_active:
+                self.execution_safety.deactivate_kill_switch(manual=False)
+                logger.info("Kill switch deactivated")
+            
+            self.trading_enabled = True
+            
+            self.recovery_status["steps"]["enable_trading"] = {
+                "status": "success",
+                "trading_enabled": True,
+            }
+            
+            logger.info("Step 5 complete: trading enabled")
+            
+        except Exception as e:
+            logger.error(f"Step 5 failed: {e}")
+            self.recovery_status["steps"]["enable_trading"] = {
+                "status": "failed",
+                "error": str(e),
+            }
+            self.trading_enabled = False
+    
+    def get_recovery_status(self) -> dict:
+        """Get current recovery status."""
+        return {
+            "recovery_complete": self.recovery_complete,
+            "trading_enabled": self.trading_enabled,
+            "recovery_status": self.recovery_status,
+        }
+
+
+# ============================================================================
+# INTEGRATION INTO MASTERAI (PATCHES)
+# Add these methods to the MasterAI class
+# ============================================================================
+
+# Patch 1: Add reliability components to MasterAI.__init__
+_original_masterai_init = MasterAI.__init__
+
+def _patched_masterai_init(self, symbols, db_path, broadcast_callback=None):
+    _original_masterai_init(self, symbols, db_path, broadcast_callback)
+    
+    # Add production reliability components
+    self.reconciliation_engine = ReconciliationEngine(db_path, self.event_bus)
+    self.event_durability_layer = EventDurabilityLayer(db_path, self.event_bus)
+    self.idempotency_layer = IdempotencyLayer(db_path)
+    self.startup_recovery = StartupRecoverySequence(
+        persistence_layer=self.persistence_layer,
+        reconciliation_engine=self.reconciliation_engine,
+        event_durability=self.event_durability_layer,
+        idempotency_layer=self.idempotency_layer,
+        execution_safety=self.execution_safety,
+        event_bus=self.event_bus,
+    )
+    
+    logger.info("Production reliability components initialized")
+
+MasterAI.__init__ = _patched_masterai_init
+
+
+# Patch 2: Add idempotent order execution method
+async def _idempotent_open_order(
+    self,
+    symbol: str,
+    order_type: str,
+    volume: float,
+    sl: float = 0.0,
+    tp: float = 0.0,
+    comment: str = "MasterAI",
+    strategy: str = "",
+) -> dict:
+    """
+    Execute order with idempotency guarantee.
+    """
+    params = {
+        "symbol": symbol,
+        "order_type": order_type,
+        "volume": volume,
+        "sl": sl,
+        "tp": tp,
+    }
+    
+    idempotency_key = self.idempotency_layer.generate_key(
+        operation_type="OPEN_ORDER",
+        symbol=symbol,
+        params=params,
+    )
+    
+    async def execute():
+        # This will be called by the idempotency layer
+        from backend import mt5_integration
+        return mt5_integration.open_order(
+            symbol=symbol,
+            order_type=order_type,
+            volume=volume,
+            sl=sl,
+            tp=tp,
+            comment=comment,
+        )
+    
+    result, was_cached = await self.idempotency_layer.check_and_store(
+        idempotency_key=idempotency_key,
+        operation_type="OPEN_ORDER",
+        symbol=symbol,
+        parameters=params,
+        executor=execute,
+    )
+    
+    if was_cached:
+        logger.info(f"Order execution deduplicated for {symbol} {order_type}")
+    
+    return result
+
+MasterAI.idempotent_open_order = _idempotent_open_order
+
+
+# Patch 3: Add idempotent close position method
+async def _idempotent_close_position(self, ticket: int, volume: Optional[float] = None) -> dict:
+    """
+    Close position with idempotency guarantee.
+    """
+    params = {"ticket": ticket, "volume": volume}
+    
+    # Find symbol for this ticket
+    symbol = "UNKNOWN"
+    for sym, pos in self.position_tracker.tracked_positions.items():
+        if pos.get("ticket") == ticket:
+            symbol = pos.get("symbol", "UNKNOWN")
+            break
+    
+    idempotency_key = self.idempotency_layer.generate_key(
+        operation_type="CLOSE_POSITION",
+        symbol=symbol,
+        params=params,
+    )
+    
+    async def execute():
+        from backend import mt5_integration
+        return mt5_integration.close_position(ticket=ticket, volume=volume)
+    
+    result, was_cached = await self.idempotency_layer.check_and_store(
+        idempotency_key=idempotency_key,
+        operation_type="CLOSE_POSITION",
+        symbol=symbol,
+        parameters=params,
+        executor=execute,
+    )
+    
+    if was_cached:
+        logger.info(f"Close position deduplicated for ticket {ticket}")
+    
+    return result
+
+MasterAI.idempotent_close_position = _idempotent_close_position
+
+
+# Patch 4: Add durable event publish wrapper
+async def _publish_durable_event(self, event_type: str, payload: dict, source: str = "MasterAI") -> str:
+    """
+    Publish an event with durability guarantee.
+    """
+    event = TradingEvent(
+        event_type=event_type,
+        source=source,
+        payload=payload,
+    )
+    return await self.event_durability_layer.publish_durable(event)
+
+MasterAI.publish_durable_event = _publish_durable_event
+
+
+# Patch 5: Add startup recovery method
+async def _execute_startup_recovery(self) -> Tuple[bool, str]:
+    """
+    Execute full startup recovery sequence.
+    Must complete successfully before trading can be enabled.
+    """
+    from backend import mt5_integration, db_get_history
+    
+    async def get_broker_positions():
+        return mt5_integration.get_positions() if mt5_integration.connected else []
+    
+    async def get_internal_positions():
+        # Get positions from trades table with status 'OPEN'
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT ticket, symbol, volume, open_price, sl, tp, order_type FROM trades WHERE status='OPEN'")
+        rows = c.fetchall()
+        conn.close()
+        return [
+            {
+                "ticket": row[0],
+                "symbol": row[1],
+                "volume": row[2],
+                "open_price": row[3],
+                "sl": row[4],
+                "tp": row[5],
+                "order_type": row[6],
+            }
+            for row in rows
+        ]
+    
+    return await self.startup_recovery.execute_recovery(
+        master_ai=self,
+        get_broker_positions_fn=get_broker_positions,
+        get_internal_positions_fn=get_internal_positions,
+    )
+
+MasterAI.execute_startup_recovery = _execute_startup_recovery
+
+
+# Patch 6: Start event durability processor in initialize
+_original_initialize = MasterAI.initialize
+
+async def _patched_initialize(self):
+    await _original_initialize(self)
+    
+    # Start event durability processor
+    async def durable_event_handler(event: TradingEvent) -> bool:
+        """Handle durable event by publishing to event bus."""
+        await self.event_bus.publish(event)
+        return True
+    
+    await self.event_durability_layer.start_processor(durable_event_handler)
+    
+    # Execute startup recovery
+    recovery_success, recovery_msg = await self.execute_startup_recovery()
+    
+    if not recovery_success:
+        logger.critical(f"STARTUP RECOVERY FAILED: {recovery_msg}")
+        logger.critical("Trading will NOT be enabled until manual intervention")
+        await self.execution_safety.activate_kill_switch(f"Startup recovery failed: {recovery_msg}")
+    else:
+        logger.info(f"Startup recovery successful: {recovery_msg}")
+    
+    logger.info("MasterAI fully initialized with production reliability layer")
+
+MasterAI.initialize = _patched_initialize
+
+
+# Patch 7: Update shutdown to stop durability processor
+_original_shutdown = MasterAI.shutdown
+
+async def _patched_shutdown(self):
+    await self.event_durability_layer.stop_processor()
+    await _original_shutdown(self)
+
+MasterAI.shutdown = _patched_shutdown
+
+
+# Patch 8: Add method to get reliability layer status
+def _get_reliability_status(self) -> dict:
+    """Get status of all production reliability components."""
+    return {
+        "reconciliation": {
+            "last_reconciliation": self.reconciliation_engine.last_reconciliation.isoformat() if self.reconciliation_engine.last_reconciliation else None,
+            "consistency_status": self.reconciliation_engine.consistency_status.value,
+        },
+        "event_durability": self.event_durability_layer.get_stats(),
+        "idempotency": self.idempotency_layer.get_stats(),
+        "startup_recovery": self.startup_recovery.get_recovery_status(),
+    }
+
+MasterAI.get_reliability_status = _get_reliability_status
