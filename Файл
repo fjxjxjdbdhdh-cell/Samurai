@@ -1,0 +1,1890 @@
+
+aurum_v3_final.py — ПОЛНАЯ ВЕРСИЯ
+XAU/USD | AURUM V3.0 + 48 новых функций
+"""
+
+import json
+import time
+import logging
+import threading
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+from collections import deque
+import numpy as np
+
+# ============================================================
+# КОНСТАНТЫ
+# ============================================================
+
+SYMBOL = "XAUUSD"
+MAGIC_NUMBER = 777
+
+NEWS_EVENTS = [
+    (2026, 7, 10, 12, 30, "NFP"),
+    (2026, 8, 7, 12, 30, "NFP"),
+    (2026, 9, 4, 12, 30, "NFP"),
+    (2026, 7, 29, 18, 0, "FOMC"),
+    (2026, 9, 17, 18, 0, "FOMC"),
+    (2026, 7, 14, 12, 30, "CPI"),
+    (2026, 8, 12, 12, 30, "CPI"),
+    (2026, 9, 15, 12, 30, "CPI"),
+]
+
+LONDON_START = 7
+LONDON_END = 16
+NY_START = 12
+NY_END = 21
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger("AURUM_V3")
+
+# ============================================================
+# ЕНАМЫ И МОДЕЛИ
+# ============================================================
+
+class StrategyMode(Enum):
+    AURUM_V3 = "aurum_v3"
+    MANUAL = "manual"
+
+class Direction(Enum):
+    BUY = 1
+    SELL = -1
+    NONE = 0
+
+@dataclass
+class Candle:
+    time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    tick_volume: float
+    spread: float = 0.0
+
+@dataclass
+class TradeSignal:
+    direction: Direction
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    pattern: str
+    confidence: float
+    r_ratio: float
+    timestamp: float = field(default_factory=time.time)
+    tp1: float = 0.0
+
+@dataclass
+class Position:
+    ticket: int
+    direction: Direction
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    volume: float
+    open_time: datetime
+    pattern: str
+    is_breakeven: bool = False
+    tp1: float = 0.0
+    tp1_hit: bool = False
+    highest_price: float = 0.0
+    lowest_price: float = float('inf')
+
+# ============================================================
+# QLearningAgent — заготовка
+# ============================================================
+
+class QLearningAgent:
+    def __init__(self, state_size: int, action_size: int):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.q_table = {}
+        self.learning_rate = 0.1
+        self.discount_factor = 0.95
+        self.epsilon = 0.1
+        self.memory = deque(maxlen=10000)
+
+    def get_action(self, state: str, training: bool = True) -> int:
+        import random
+        if training and random.random() < self.epsilon:
+            return random.randint(0, self.action_size - 1)
+        if state not in self.q_table:
+            self.q_table[state] = np.zeros(self.action_size)
+        return np.argmax(self.q_table[state])
+
+    def store_experience(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def train(self, batch_size=32):
+        import random
+        if len(self.memory) < batch_size:
+            return
+        batch = random.sample(list(self.memory), batch_size)
+        for state, action, reward, next_state, done in batch:
+            if state not in self.q_table:
+                self.q_table[state] = np.zeros(self.action_size)
+            if next_state not in self.q_table:
+                self.q_table[next_state] = np.zeros(self.action_size)
+            current_q = self.q_table[state][action]
+            target_q = reward if done else reward + self.discount_factor * np.max(self.q_table[next_state])
+            self.q_table[state][action] += self.learning_rate * (target_q - current_q)
+
+    def get_state_quality(self, state: str) -> float:
+        if state not in self.q_table:
+            return 0.0
+        return float(np.max(self.q_table[state]))
+
+# ============================================================
+# НОВОСТНОЙ ФИЛЬТР
+# ============================================================
+
+class NewsFilter:
+    def __init__(self, events=None):
+        self.events = events or NEWS_EVENTS
+
+    def is_news_near(self):
+        now = datetime.utcnow()
+        for event in self.events:
+            event_time = datetime(event[0], event[1], event[2], event[3], event[4])
+            if abs((now - event_time).total_seconds()) < 900:
+                return True
+        return False
+
+# ============================================================
+# MT5 ИНТЕГРАЦИЯ
+# ============================================================
+
+class MT5Integration:
+    _instances: Dict[str, 'MT5Integration'] = {}
+    _lock = threading.Lock()
+
+    def __new__(cls, connection_id: str = "default", **kwargs):
+        with cls._lock:
+            if connection_id not in cls._instances:
+                instance = super().__new__(cls)
+                instance._initialized = False
+                cls._instances[connection_id] = instance
+            return cls._instances[connection_id]
+
+    def __init__(self, connection_id: str = "default", path=None, login=None, password=None, server=None):
+        if self._initialized:
+            return
+        self.connection_id = connection_id
+        self.path = path
+        self.login = login
+        self.password = password
+        self.server = server
+        self.connected = False
+        self._mt5 = None
+        try:
+            import MetaTrader5 as mt5
+            self._mt5 = mt5
+        except ImportError:
+            logger.warning("MetaTrader5 не установлен. Демо-режим.")
+        self._initialized = True
+
+    def connect(self) -> bool:
+        if self._mt5 is None:
+            self.connected = True
+            return True
+        try:
+            if not self._mt5.initialize(path=self.path, login=self.login, password=self.password, server=self.server):
+                logger.error(f"Ошибка MT5: {self._mt5.last_error()}")
+                return False
+            self.connected = True
+            return True
+        except Exception as e:
+            logger.error(f"Исключение MT5: {e}")
+            return False
+
+    def disconnect(self):
+        if self._mt5 and self.connected:
+            self._mt5.shutdown()
+            self.connected = False
+
+    def reconnect(self) -> bool:
+        self.disconnect()
+        time.sleep(2)
+        return self.connect()
+
+    def get_account_info(self) -> Dict:
+        if not self.connected or self._mt5 is None:
+            return {"balance": 10000, "equity": 10000, "margin": 0, "free_margin": 10000}
+        try:
+            info = self._mt5.account_info()
+            if info is None:
+                return {}
+            return {"balance": info.balance, "equity": info.equity, "margin": info.margin, "free_margin": info.margin_free}
+        except:
+            return {}
+
+    def get_positions(self, symbol=None) -> List[Dict]:
+        if not self.connected or self._mt5 is None:
+            return []
+        try:
+            positions = self._mt5.positions_get(symbol=symbol) if symbol else self._mt5.positions_get()
+            if positions is None:
+                return []
+            result = []
+            for pos in positions:
+                result.append({
+                    "ticket": pos.ticket, "symbol": pos.symbol,
+                    "type": "BUY" if pos.type == 0 else "SELL",
+                    "volume": pos.volume, "open_price": pos.price_open,
+                    "current_price": pos.price_current, "sl": pos.sl, "tp": pos.tp,
+                    "profit": pos.profit, "open_time": datetime.fromtimestamp(pos.time)
+                })
+            return result
+        except:
+            return []
+
+    def open_order(self, symbol: str, order_type: str, volume: float,
+                   price=0.0, sl=0.0, tp=0.0, comment="AURUM") -> Optional[int]:
+        if not self.connected or self._mt5 is None:
+            import random
+            return random.randint(10000, 99999)
+        try:
+            request = {
+                "action": self._mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": volume,
+                "type": self._mt5.ORDER_TYPE_BUY if order_type.upper() == "BUY" else self._mt5.ORDER_TYPE_SELL,
+                "price": price if price > 0 else self._get_real_price(symbol, order_type),
+                "sl": sl, "tp": tp, "deviation": 20, "magic": MAGIC_NUMBER, "comment": comment,
+                "type_time": self._mt5.ORDER_TIME_GTC, "type_filling": self._mt5.ORDER_FILLING_IOC,
+            }
+            result = self._mt5.order_send(request)
+            if result.retcode != self._mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Ошибка ордера: {result.comment}")
+                return None
+            return result.order
+        except:
+            return None
+
+    def close_position(self, ticket: int, volume=None) -> bool:
+        if not self.connected or self._mt5 is None:
+            return True
+        try:
+            pos = self._mt5.positions_get(ticket=ticket)
+            if pos is None or len(pos) == 0:
+                return False
+            pos = pos[0]
+            close_type = self._mt5.ORDER_TYPE_SELL if pos.type == 0 else self._mt5.ORDER_TYPE_BUY
+            request = {
+                "action": self._mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol,
+                "volume": volume if volume else pos.volume, "type": close_type, "position": ticket,
+                "price": self._mt5.symbol_info_tick(pos.symbol).bid if close_type == self._mt5.ORDER_TYPE_SELL else self._mt5.symbol_info_tick(pos.symbol).ask,
+                "deviation": 20, "magic": MAGIC_NUMBER, "comment": "Close AURUM",
+                "type_time": self._mt5.ORDER_TIME_GTC, "type_filling": self._mt5.ORDER_FILLING_IOC,
+            }
+            result = self._mt5.order_send(request)
+            if result.retcode != self._mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Ошибка закрытия: {result.comment}")
+                return False
+            return True
+        except:
+            return False
+
+    def modify_position(self, ticket: int, sl=None, tp=None) -> bool:
+        if not self.connected or self._mt5 is None:
+            return True
+        try:
+            pos = self._mt5.positions_get(ticket=ticket)
+            if pos is None or len(pos) == 0:
+                return False
+            pos = pos[0]
+            request = {
+                "action": self._mt5.TRADE_ACTION_SLTP, "position": ticket, "symbol": pos.symbol,
+                "sl": sl if sl is not None else pos.sl, "tp": tp if tp is not None else pos.tp,
+            }
+            result = self._mt5.order_send(request)
+            return result.retcode == self._mt5.TRADE_RETCODE_DONE
+        except:
+            return False
+
+    def get_rates(self, symbol: str, timeframe, count: int = 100) -> List[Candle]:
+        if not self.connected or self._mt5 is None:
+            return self._generate_demo_rates(count)
+        try:
+            rates = self._mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+            if rates is None:
+                return []
+            return [Candle(time=datetime.fromtimestamp(r['time']), open=r['open'], high=r['high'],
+                           low=r['low'], close=r['close'], tick_volume=r['tick_volume'], spread=r['spread'])
+                    for r in rates]
+        except:
+            return []
+
+    def _get_real_price(self, symbol: str, order_type: str) -> float:
+        if not self.connected or self._mt5 is None:
+            return 2650.0
+        try:
+            tick = self._mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return 0.0
+            return tick.ask if order_type.upper() == "BUY" else tick.bid
+        except:
+            return 0.0
+
+    def _generate_demo_rates(self, count: int) -> List[Candle]:
+        import random
+        candles = []
+        price = 2650.0
+        now = datetime.utcnow()
+        for i in range(count):
+            change = random.uniform(-3, 3)
+            price += change
+            candles.append(Candle(time=now - timedelta(hours=count-i),
+                                  open=price - random.uniform(-1, 1), high=price + random.uniform(0.5, 2),
+                                  low=price - random.uniform(0.5, 2), close=price,
+                                  tick_volume=random.uniform(100, 1000)))
+        return candles
+
+# ============================================================
+# MARKET INTELLIGENCE — РАСШИРЕННАЯ ВЕРСИЯ
+# ============================================================
+
+class MarketIntelligence:
+    def __init__(self):
+        self.h4_candles = []
+        self.h1_candles = []
+        self.m15_candles = []
+        self.swing_highs = []
+        self.swing_lows = []
+        self.support_levels = []
+        self.resistance_levels = []
+        self.volatility = 0.0
+        self.trend_strength = 0.0
+        self.momentum = 0.0
+        self.regime = "neutral"
+        self.volume_profile = {}
+        self.order_blocks = []
+        self.fvg_zones = []
+        self.imbalance_zones = []
+        self.liquidity_zones = []
+
+    def update(self, h4, h1, m15):
+        self.h4_candles = h4
+        self.h1_candles = h1
+        self.m15_candles = m15
+        self._update_swing_points()
+        self._calc_volatility()
+        self._calc_trend_strength()
+        self._calc_momentum()
+        self._detect_regime()
+        self._find_real_support_levels()
+        self._find_real_resistance_levels()
+        self._calc_volume_profile()
+        self._find_order_blocks()
+        self._find_fvg_zones()
+        self._find_liquidity_zones()
+        self._find_imbalance_zones()
+
+    def get_regime(self): return self.regime
+    def get_support_levels(self): return self.support_levels
+    def get_resistance_levels(self): return self.resistance_levels
+
+    def _update_swing_points(self):
+        if len(self.h4_candles) < 5:
+            return
+        for i in range(2, len(self.h4_candles) - 2):
+            c = self.h4_candles[i]
+            if all(c.high > self.h4_candles[i-j].high for j in range(1, 3)) and \
+               all(c.high > self.h4_candles[i+j].high for j in range(1, 3)):
+                self.swing_highs.append(c.high)
+            if all(c.low < self.h4_candles[i-j].low for j in range(1, 3)) and \
+               all(c.low < self.h4_candles[i+j].low for j in range(1, 3)):
+                self.swing_lows.append(c.low)
+
+    def _calc_volatility(self):
+        if len(self.h1_candles) < 14:
+            return
+        ranges = [c.high - c.low for c in self.h1_candles[-14:]]
+        self.volatility = sum(ranges) / len(ranges)
+
+    def _calc_trend_strength(self):
+        if len(self.h4_candles) < 20:
+            return
+        closes = [c.close for c in self.h4_candles[-20:]]
+        x = list(range(20))
+        slope = np.polyfit(x, closes, 1)[0]
+        self.trend_strength = slope / closes[-1] * 100
+
+    def _calc_momentum(self):
+        if len(self.h4_candles) < 10:
+            return
+        self.momentum = self.h4_candles[-1].close - self.h4_candles[-10].close
+
+    def _detect_regime(self):
+        if abs(self.trend_strength) > 0.02:
+            self.regime = "trending_up" if self.trend_strength > 0 else "trending_down"
+        elif self.volatility > 5:
+            self.regime = "volatile"
+        else:
+            self.regime = "ranging"
+
+    def _find_real_support_levels(self):
+        if self.swing_lows:
+            self.support_levels = sorted(set(round(s, 1) for s in self.swing_lows[-5:]))
+
+    def _find_real_resistance_levels(self):
+        if self.swing_highs:
+            self.resistance_levels = sorted(set(round(s, 1) for s in self.swing_highs[-5:]))
+
+    def _calc_volume_profile(self):
+        if not self.h1_candles:
+            return
+        for c in self.h1_candles[-50:]:
+            level = round(c.close, 0)
+            self.volume_profile[level] = self.volume_profile.get(level, 0) + c.tick_volume
+
+    # ========== НОВЫЕ МЕТОДЫ ==========
+
+    def get_volume_peaks(self, top_n=3):
+        """Уровни с максимальным объёмом"""
+        if not self.volume_profile:
+            return []
+        return sorted(self.volume_profile, key=self.volume_profile.get, reverse=True)[:top_n]
+
+    def get_level_strength(self, level, tolerance=0.5):
+        """Сила уровня 0-1 на основе касаний и объёма"""
+        touches = sum(1 for c in self.h1_candles[-100:]
+                      if abs(c.high - level) < tolerance or abs(c.low - level) < tolerance)
+        vol = sum(c.tick_volume for c in self.h1_candles[-100:]
+                  if abs(c.close - level) < tolerance)
+        max_touches = max(1, max(sum(1 for c in self.h1_candles[-100:]
+                                     if abs(c.high - l) < tolerance or abs(c.low - l) < tolerance)
+                                 for l in self.support_levels + self.resistance_levels))
+        max_vol = max(1, max(sum(c.tick_volume for c in self.h1_candles[-100:]
+                                 if abs(c.close - l) < tolerance)
+                             for l in self.support_levels + self.resistance_levels))
+        return min(1.0, (touches / max_touches * 0.5 + vol / max_vol * 0.5))
+
+    def detect_market_structure(self):
+        """HH/HL = восходящий, LH/LL = нисходящий"""
+        if len(self.swing_highs) < 2 or len(self.swing_lows) < 2:
+            return "neutral"
+        hh = self.swing_highs[-1] > self.swing_highs[-2]
+        hl = self.swing_lows[-1] > self.swing_lows[-2]
+        lh = self.swing_highs[-1] < self.swing_highs[-2]
+        ll = self.swing_lows[-1] < self.swing_lows[-2]
+        if hh and hl: return "bullish"
+        if lh and ll: return "bearish"
+        return "neutral"
+
+    def get_liquidity_zones(self):
+        """Где скопились стопы — за экстремумами свинг-поинтов"""
+        zones = []
+        if self.swing_lows:
+            zones.append({"side": "below", "price": min(self.swing_lows[-3:]) - 1.0})
+        if self.swing_highs:
+            zones.append({"side": "above", "price": max(self.swing_highs[-3:]) + 1.0})
+        return zones
+
+    def get_imbalance_zones(self):
+        """Где цена прошла без отката (большие свечи)"""
+        zones = []
+        for i in range(1, min(len(self.h1_candles), 20)):
+            c = self.h1_candles[-i]
+            body = abs(c.close - c.open)
+            if body > (c.high - c.low) * 0.7 and body > self.volatility * 1.5:
+                zones.append({"low": min(c.open, c.close), "high": max(c.open, c.close)})
+        return zones
+
+    def get_order_blocks(self):
+        """Последняя свеча перед импульсом — зона входа крупных игроков"""
+        blocks = []
+        for i in range(2, min(len(self.h1_candles), 30)):
+            prev = self.h1_candles[-i]
+            curr = self.h1_candles[-i+1]
+            body_ratio = abs(curr.close - curr.open) / max(curr.high - curr.low, 0.01)
+            if body_ratio > 0.6 and abs(curr.close - curr.open) > self.volatility:
+                blocks.append({"low": min(prev.low, prev.open), "high": max(prev.high, prev.close)})
+        return blocks[-3:]
+
+    def detect_choch(self):
+        """Change of Character — смена структуры тренда"""
+        if len(self.h4_candles) < 10:
+            return False
+        structure = self.detect_market_structure()
+        return structure == "neutral"
+
+    def detect_bos(self):
+        """Break of Structure — пробой последнего свинг-поинта"""
+        if not self.swing_highs or not self.swing_lows:
+            return False
+        price = self.h4_candles[-1].close
+        return price > self.swing_highs[-1] or price < self.swing_lows[-1]
+
+    def get_fvg_zones(self):
+        """Fair Value Gaps — разрыв между high[1] и low[3]"""
+        gaps = []
+        for i in range(3, min(len(self.h1_candles), 30)):
+            c1 = self.h1_candles[-i]
+            c3 = self.h1_candles[-i-2]
+            if c1.low > c3.high:
+                gaps.append({"low": c3.high, "high": c1.low, "type": "bullish"})
+            if c1.high < c3.low:
+                gaps.append({"low": c1.high, "high": c3.low, "type": "bearish"})
+        return gaps
+
+    def get_premium_discount(self):
+        """Цена выше/ниже равновесной зоны (середина последнего диапазона)"""
+        if not self.h1_candles:
+            return "neutral"
+        recent = self.h1_candles[-20:]
+        eq = (max(c.high for c in recent) + min(c.low for c in recent)) / 2
+        price = self.h1_candles[-1].close
+        if price > eq * 1.005:
+            return "premium"
+        if price < eq * 0.995:
+            return "discount"
+        return "equilibrium"
+
+    def _find_order_blocks(self):
+        self.order_blocks = self.get_order_blocks()
+
+    def _find_fvg_zones(self):
+        self.fvg_zones = self.get_fvg_zones()
+
+    def _find_liquidity_zones(self):
+        self.liquidity_zones = self.get_liquidity_zones()
+
+    def _find_imbalance_zones(self):
+        self.imbalance_zones = self.get_imbalance_zones()
+
+    def get_technical_indicators(self):
+        return {"volatility": self.volatility, "trend_strength": self.trend_strength,
+                "momentum": self.momentum, "regime": self.regime}
+
+    def build_state_vector(self):
+        return np.array([
+            self.volatility / 10 if self.volatility > 0 else 0, self.trend_strength,
+            self.momentum / 10 if abs(self.momentum) > 0 else 0,
+            1 if self.regime == "trending_up" else 0,
+            1 if self.regime == "trending_down" else 0,
+            1 if self.regime == "ranging" else 0,
+            len(self.support_levels) / 5, len(self.resistance_levels) / 5,
+        ])
+
+    def get_market_summary(self):
+        return f"Рынок: {self.regime}. Волатильность: {self.volatility:.2f}. Тренд: {self.trend_strength:.3f}"
+
+# ============================================================
+# RISK ENGINE
+# ============================================================
+
+class RiskEngine:
+    def __init__(self, initial_balance: float = 10000, max_risk_percent: float = 2.0):
+        self.initial_balance = initial_balance
+        self.current_balance = initial_balance
+        self.equity = initial_balance
+        self.max_risk_percent = max_risk_percent
+        self.daily_trades = 0
+        self.max_daily_trades = 10
+        self.daily_loss = 0.0
+        self.max_daily_loss = initial_balance * 0.05
+        self.consecutive_losses = 0
+        self.max_consecutive_losses = 5
+        self.risk_multiplier = 1.0
+        self.last_reset_date = datetime.now().date()
+        self.win_history = []  # Для расчёта Келли
+
+    def reset_daily_if_needed(self):
+        today = datetime.now().date()
+        if today != self.last_reset_date:
+            self.daily_trades = 0
+            self.daily_loss = 0.0
+            self.last_reset_date = today
+
+    def update_equity(self, new_equity: float):
+        self.equity = new_equity
+        if new_equity > self.current_balance:
+            self.current_balance = new_equity
+
+    def record_trade_result(self, profit: float):
+        self.daily_trades += 1
+        self.win_history.append(1 if profit > 0 else 0)
+        if len(self.win_history) > 50:
+            self.win_history.pop(0)
+        if profit < 0:
+            self.daily_loss += abs(profit)
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+        self.current_balance += profit
+        self._update_risk_multiplier()
+
+    def _update_risk_multiplier(self):
+        if self.consecutive_losses >= 3:
+            self.risk_multiplier = max(0.25, 1.0 - self.consecutive_losses * 0.25)
+        else:
+            self.risk_multiplier = min(2.0, 1.0 + (self.current_balance / self.initial_balance - 1) * 0.5)
+
+    def can_open_trade(self) -> bool:
+        self.reset_daily_if_needed()
+        return not (self.daily_trades >= self.max_daily_trades or
+                    self.daily_loss >= self.max_daily_loss or
+                    self.consecutive_losses >= self.max_consecutive_losses)
+
+    def calculate_position_size(self, entry: float, stop_loss: float) -> float:
+        risk_amount = self.current_balance * self.max_risk_percent / 100 * self.risk_multiplier
+        pip_risk = abs(entry - stop_loss)
+        if pip_risk == 0:
+            return 0.01
+        return round(risk_amount / (pip_risk * 1.0), 2)
+
+    def get_win_rate(self):
+        if not self.win_history:
+            return 0.5
+        return sum(self.win_history) / len(self.win_history)
+
+    def calculate_kelly_fraction(self):
+        """Оптимальный % риска по формуле Келли"""
+        wr = self.get_win_rate()
+        if wr <= 0.5:
+            return 0.01
+        avg_win = 2.0
+        avg_loss = 1.0
+        kelly = wr - (1 - wr) / (avg_win / avg_loss)
+        return max(0.005, min(0.05, kelly * 0.5))
+
+    def get_risk_report(self) -> Dict:
+        return {"balance": self.current_balance, "daily_trades": self.daily_trades,
+                "daily_loss": self.daily_loss, "risk_multiplier": self.risk_multiplier,
+                "consecutive_losses": self.consecutive_losses, "win_rate": self.get_win_rate()}
+
+class AdvancedRiskEngine(RiskEngine):
+    def __init__(self, initial_balance: float = 10000):
+        super().__init__(initial_balance)
+        self.returns_history = []
+        self.var_95 = 0.0
+        self.portfolio_volatility = 0.0
+        self.alerts = []
+
+    def record_symbol_return(self, symbol: str, return_value: float):
+        self.returns_history.append(return_value)
+        if len(self.returns_history) > 252:
+            self.returns_history.pop(0)
+
+    def compute_var(self, confidence: float = 0.95) -> float:
+        if len(self.returns_history) < 20:
+            return 0.0
+        sorted_returns = sorted(self.returns_history)
+        index = int(len(sorted_returns) * (1 - confidence))
+        self.var_95 = abs(sorted_returns[index])
+        return self.var_95
+
+    def compute_portfolio_volatility(self) -> float:
+        if len(self.returns_history) < 2:
+            return 0.0
+        self.portfolio_volatility = float(np.std(self.returns_history))
+        return self.portfolio_volatility
+
+    def compute_portfolio_risk_score(self) -> float:
+        score = self.portfolio_volatility * 10
+        score += (self.daily_loss / self.initial_balance) * 100 if self.initial_balance > 0 else 0
+        return min(score, 100.0)
+
+    def get_full_risk_report(self) -> Dict:
+        return {**self.get_risk_report(), "var_95": self.var_95,
+                "portfolio_volatility": self.portfolio_volatility,
+                "risk_score": self.compute_portfolio_risk_score()}
+
+# ============================================================
+# EXECUTION SAFETY LAYER
+# ============================================================
+
+class ExecutionSafetyLayer:
+    def __init__(self):
+        self.kill_switch_active = False
+        self.cooldowns = {}
+        self.daily_trades = 0
+        self.max_daily_trades = 20
+        self.last_reset = datetime.now().date()
+        self.recent_signals = []
+        self.blocked_symbols = []
+
+    def activate_kill_switch(self, reason: str = "manual"):
+        self.kill_switch_active = True
+        logger.warning(f"KILL SWITCH: {reason}")
+
+    def deactivate_kill_switch(self):
+        self.kill_switch_active = False
+
+    def is_in_cooldown(self, symbol: str) -> bool:
+        return time.time() < self.cooldowns.get(symbol, 0)
+
+    def set_cooldown(self, symbol: str, seconds: int = 300):
+        self.cooldowns[symbol] = time.time() + seconds
+
+    def _reset_daily_counter_if_needed(self):
+        today = datetime.now().date()
+        if today != self.last_reset:
+            self.daily_trades = 0
+            self.last_reset = today
+
+    def increment_trade_count(self):
+        self._reset_daily_counter_if_needed()
+        self.daily_trades += 1
+
+    def is_overtrading(self) -> bool:
+        self._reset_daily_counter_if_needed()
+        return self.daily_trades >= self.max_daily_trades
+
+    def is_duplicate_signal(self, signal: TradeSignal, time_window: int = 60) -> bool:
+        now = time.time()
+        for s in self.recent_signals:
+            if s["direction"] == signal.direction and now - s["time"] < time_window:
+                return True
+        return False
+
+    def register_signal(self, signal: TradeSignal):
+        self.recent_signals.append({"direction": signal.direction, "time": time.time()})
+        if len(self.recent_signals) > 50:
+            self.recent_signals = self.recent_signals[-50:]
+
+    def has_conflicting_position(self, direction: Direction, positions: List[Position]) -> bool:
+        return any(p.direction != direction for p in positions)
+
+    def is_execution_allowed(self, signal: TradeSignal, positions: List[Position]) -> bool:
+        if self.kill_switch_active or self.is_overtrading():
+            return False
+        if self.is_duplicate_signal(signal):
+            return False
+        if self.has_conflicting_position(signal.direction, positions):
+            return False
+        return True
+
+    def on_trade_executed(self, signal: TradeSignal):
+        self.increment_trade_count()
+        self.register_signal(signal)
+
+    def block_symbol(self, symbol: str, reason: str = ""):
+        if symbol not in self.blocked_symbols:
+            self.blocked_symbols.append(symbol)
+
+    def unblock_symbol(self, symbol: str):
+        if symbol in self.blocked_symbols:
+            self.blocked_symbols.remove(symbol)
+
+    def get_safety_report(self) -> Dict:
+        return {"kill_switch": self.kill_switch_active, "daily_trades": self.daily_trades,
+                "blocked_symbols": self.blocked_symbols}
+
+# ============================================================
+# PERSISTENCE LAYER
+# ============================================================
+
+class PersistenceLayer:
+    def __init__(self, db_path: str = "aurum_state.db"):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self.operation_log = []
+        self._init_persistence_db()
+
+    def _init_persistence_db(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ticket INTEGER,
+                direction TEXT, entry REAL, sl REAL, tp REAL,
+                pattern TEXT, profit REAL, open_time TEXT,
+                close_time TEXT, regime TEXT, score REAL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS equity_curve (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, equity REAL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS saved_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE,
+                data TEXT, saved_at TEXT)""")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Ошибка БД: {e}")
+
+    def save_analytics_engine(self, engine):
+        self._save_json("analytics", engine.get_full_report())
+
+    def load_analytics_engine(self):
+        return self._load_json("analytics")
+
+    def save_advanced_risk_engine(self, engine):
+        self._save_json("risk", engine.get_full_risk_report())
+
+    def load_advanced_risk_engine(self):
+        return self._load_json("risk")
+
+    def save_signal_log(self, signal_log):
+        self._save_json("signal_log", signal_log)
+
+    def load_signal_log(self):
+        return self._load_json("signal_log")
+
+    def save_closed_trades_log(self, trades_log):
+        self._save_json("closed_trades_log", trades_log)
+
+    def load_closed_trades_log(self):
+        return self._load_json("closed_trades_log")
+
+    def save_all(self, components: Dict):
+        for name, comp in components.items():
+            if name == "analytics":
+                self.save_analytics_engine(comp)
+            elif name == "risk":
+                self.save_advanced_risk_engine(comp)
+            elif name == "signal_log":
+                self.save_signal_log(comp)
+            elif name == "closed_trades_log":
+                self.save_closed_trades_log(comp)
+
+    def load_all(self) -> Dict:
+        return {"analytics": self.load_analytics_engine(), "risk": self.load_advanced_risk_engine(),
+                "signal_log": self.load_signal_log(), "closed_trades_log": self.load_closed_trades_log()}
+
+    def _save_json(self, name: str, data: Any):
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                json_data = json.dumps(data, default=str)
+                conn.execute("INSERT OR REPLACE INTO saved_states (name, data, saved_at) VALUES (?, ?, ?)",
+                             (name, json_data, datetime.now().isoformat()))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Ошибка сохранения {name}: {e}")
+
+    def _load_json(self, name: str) -> Any:
+        with self._lock:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.execute("SELECT data FROM saved_states WHERE name = ?", (name,))
+                row = cursor.fetchone()
+                conn.close()
+                return json.loads(row[0]) if row else {}
+            except:
+                return {}
+
+# ============================================================
+# PERFORMANCE ANALYTICS
+# ============================================================
+
+class PerformanceAnalyticsEngine:
+    def __init__(self):
+        self.equity_curve = []
+        self.trade_results = []
+        self.win_rate = 0.0
+        self.profit_factor = 0.0
+        self.hourly_performance = {}
+        self.daily_performance = {}
+
+    def record_equity_point(self, equity: float, timestamp=None):
+        self.equity_curve.append({"time": timestamp or time.time(), "equity": equity})
+
+    def record_trade_result(self, result: Dict):
+        self.trade_results.append(result)
+        hour = result.get("hour", 0)
+        day = result.get("day", "")
+        if hour not in self.hourly_performance:
+            self.hourly_performance[hour] = []
+        self.hourly_performance[hour].append(result.get("profit", 0))
+        if day not in self.daily_performance:
+            self.daily_performance[day] = []
+        self.daily_performance[day].append(result.get("profit", 0))
+        self._update_ratios()
+
+    def _update_ratios(self):
+        if not self.trade_results:
+            return
+        wins = [t for t in self.trade_results if t.get("profit", 0) > 0]
+        losses = [t for t in self.trade_results if t.get("profit", 0) <= 0]
+        self.win_rate = len(wins) / len(self.trade_results)
+        total_profit = sum(t.get("profit", 0) for t in wins)
+        total_loss = abs(sum(t.get("profit", 0) for t in losses))
+        self.profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
+
+    def get_best_trading_hours(self):
+        if not self.hourly_performance:
+            return []
+        return sorted(self.hourly_performance, key=lambda h: sum(self.hourly_performance[h]) / max(1, len(self.hourly_performance[h])), reverse=True)[:3]
+
+    def get_worst_trading_hours(self):
+        if not self.hourly_performance:
+            return []
+        return sorted(self.hourly_performance, key=lambda h: sum(self.hourly_performance[h]) / max(1, len(self.hourly_performance[h])))[:3]
+
+    def filter_by_day_of_week(self, day):
+        return self.daily_performance.get(day, [])
+
+    def get_full_report(self) -> Dict:
+        return {"total_trades": len(self.trade_results), "win_rate": self.win_rate,
+                "profit_factor": self.profit_factor, "best_hours": self.get_best_trading_hours(),
+                "worst_hours": self.get_worst_trading_hours()}
+
+    def get_equity_curve(self):
+        return self.equity_curve
+
+# ============================================================
+# EVENT BUS
+# ============================================================
+
+class EventBus:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._subscribers = {}
+            cls._instance._lock = threading.Lock()
+            cls._instance._running = False
+            cls._instance._queue = deque()
+        return cls._instance
+
+    def subscribe(self, event: str, callback: Callable):
+        with self._lock:
+            self._subscribers.setdefault(event, []).append(callback)
+
+    def publish(self, event: str, data: Any = None):
+        self._queue.append((event, data))
+
+    def publish_sync(self, event: str, data: Any = None):
+        self._dispatch(event, data)
+
+    def _dispatch(self, event: str, data: Any):
+        with self._lock:
+            for cb in self._subscribers.get(event, []):
+                try:
+                    cb(data)
+                except Exception as e:
+                    logger.error(f"Ошибка EventBus: {e}")
+
+    def start(self):
+        self._running = True
+        threading.Thread(target=self._process_loop, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+
+    def _process_loop(self):
+        while self._running:
+            if self._queue:
+                event, data = self._queue.popleft()
+                self._dispatch(event, data)
+            else:
+                time.sleep(0.01)
+
+# ============================================================
+# POSITION TRACKER
+# ============================================================
+
+class PositionTracker:
+    def __init__(self):
+        self.positions = {}
+        self.alerts = []
+
+    def update_position(self, ticket: int, data: Dict):
+        self.positions[ticket] = data
+
+    def remove_position(self, ticket: int):
+        if ticket in self.positions:
+            del self.positions[ticket]
+
+    def get_positions_summary(self):
+        return [{"ticket": t, "direction": p.get("direction"), "entry": p.get("entry"), "pnl": p.get("profit", 0)}
+                for t, p in self.positions.items()]
+
+# ============================================================
+# DECISION ENGINE
+# ============================================================
+
+class DecisionEngine:
+    def __init__(self):
+        self.cooldowns = {}
+        self.stats = {"decisions_made": 0, "trades_opened": 0}
+
+    def is_in_cooldown(self, symbol: str) -> bool:
+        return time.time() < self.cooldowns.get(symbol, 0)
+
+    def set_cooldown(self, symbol: str, seconds: int = 300):
+        self.cooldowns[symbol] = time.time() + seconds
+
+    def make_decision(self, signal: TradeSignal, risk_engine: RiskEngine) -> bool:
+        self.stats["decisions_made"] += 1
+        if not risk_engine.can_open_trade():
+            return False
+        if signal.confidence < 0.6:
+            return False
+        self.stats["trades_opened"] += 1
+        return True
+
+    def get_stats(self) -> Dict:
+        return self.stats
+
+# ============================================================
+# CHAT ENGINE
+# ============================================================
+
+class ChatEngine:
+    def __init__(self):
+        self.history = []
+        self.max_history = 50
+
+    def generate_response(self, message: str, context: Dict = None) -> str:
+        self.history.append({"role": "user", "content": message})
+        msg = message.lower().strip()
+        ctx = context or {}
+
+        if msg.startswith('/'):
+            response = self._handle_command(msg, ctx)
+        else:
+            response = self._smart_reply(msg, ctx)
+
+        self.history.append({"role": "assistant", "content": response})
+        if len(self.history) > self.max_history:
+            self.history = self.history[-self.max_history:]
+        return response
+
+    def _handle_command(self, cmd: str, ctx: Dict) -> str:
+        parts = cmd.split()
+        command = parts[0].lower()
+        if command == '/status':
+            s = ctx.get('status', {})
+            return f"📊 Режим: {s.get('mode','N/A')} | Сессия: {'✅' if s.get('session_active') else '❌'} | Позиций: {s.get('open_positions',0)} | PnL: {s.get('daily_pnl',0):.2f}$"
+        if command == '/positions':
+            pos = ctx.get('positions', [])
+            return "📭 Позиций нет." if not pos else "📋 " + "\n".join(f"• {p['direction']} | Вход: {p['entry']:.2f} | PnL: {p.get('pnl',0):.2f}$" for p in pos)
+        if command == '/signal':
+            s = ctx.get('last_signal')
+            return f"🔔 {s['direction']} | {s['pattern']} | R={s['r_ratio']:.1f} | Скор: {s.get('score','?')}" if s else "🔕 Сигналов нет."
+        if command == '/help':
+            return "📚 /status | /positions | /signal | /mode [aurum|manual] | /weekly | /report | /help"
+        if command == '/weekly':
+            r = ctx.get('weekly_report', {})
+            return f"📅 Неделя: {r.get('trades',0)} сделок, PnL: {r.get('pnl',0):.2f}$, WR: {r.get('win_rate',0)*100:.0f}%"
+        if command == '/report':
+            r = ctx.get('analytics', {})
+            return f"📊 Сделок: {r.get('total_trades',0)}, WR: {r.get('win_rate',0)*100:.0f}%, PF: {r.get('profit_factor',0):.1f}"
+        return f"❓ {command} — неизвестно. /help для списка."
+
+    def _smart_reply(self, msg: str, ctx: Dict) -> str:
+        import random
+        if any(w in msg for w in ['привет', 'здравствуй', 'hello']):
+            return "👋 Привет! Я AURUM V3.0. Спрашивай о стратегии, рынке или давай поболтаем!"
+        if any(w in msg for w in ['стратеги', 'aurum', 'как работаешь']):
+            return "📖 AURUM V3.0: пробой консолидации на H1 в сторону тренда H4, подтверждённый объёмом и RSI дивергенцией. Цель ≥1.5R. Скоринг сигналов 0-9. Частичная фиксация на TP1."
+        if any(w in msg for w in ['золото', 'рынок']):
+            return f"📊 XAU/USD. Сессия: {'✅' if ctx.get('session_active') else '❌'}. Режим: {ctx.get('status',{}).get('regime','?')}."
+        return random.choice(["🤔 Спрашивай — я здесь!", "Интересно! Расскажи подробнее.", "Я тут чтобы помочь."])
+
+# ============================================================
+# AURUM V3.0 STRATEGY ENGINE — ПОЛНАЯ ВЕРСИЯ (22 НОВЫХ ФУНКЦИИ)
+# ============================================================
+
+class AurumStrategyEngine:
+    def __init__(self):
+        self.name = "AURUM_V3.0"
+        self.symbol = SYMBOL
+        self.h4_candles = []
+        self.h1_candles = []
+        self.m15_candles = []
+        self.ema20_h4 = 0.0
+        self.ema20_h1 = 0.0
+        self.atr14_h1 = 0.0
+        self.swing_highs_h4 = []
+        self.swing_lows_h4 = []
+        self.news_filter = NewsFilter()
+
+    # ========== БАЗОВЫЕ МЕТОДЫ ==========
+
+    def is_active_session(self):
+        hour = datetime.utcnow().hour
+        return (LONDON_START <= hour < LONDON_END) or (NY_START <= hour < NY_END)
+
+    def get_session_priority(self):
+        hour = datetime.utcnow().hour
+        if NY_START <= hour < LONDON_END: return 2
+        if LONDON_START <= hour < NY_START or LONDON_END <= hour < NY_END: return 1
+        return 0
+
+    def _calc_ema(self, candles, period):
+        if len(candles) < period: return candles[-1].close if candles else 0.0
+        closes = [c.close for c in candles]
+        multiplier = 2.0 / (period + 1)
+        ema = sum(closes[:period]) / period
+        for price in closes[period:]: ema = (price - ema) * multiplier + ema
+        return ema
+
+    def _find_swing_points(self, candles, lookback=2):
+        highs, lows = [], []
+        for i in range(lookback, len(candles) - lookback):
+            c = candles[i]
+            if all(c.high > candles[i-j].high for j in range(1, lookback+1)) and all(c.high > candles[i+j].high for j in range(1, lookback+1)): highs.append(c.high)
+            if all(c.low < candles[i-j].low for j in range(1, lookback+1)) and all(c.low < candles[i+j].low for j in range(1, lookback+1)): lows.append(c.low)
+        return highs, lows
+
+    def get_h4_context(self):
+        if len(self.h4_candles) < 20: return Direction.NONE
+        self.ema20_h4 = self._calc_ema(self.h4_candles, 20)
+        self.swing_highs_h4, self.swing_lows_h4 = self._find_swing_points(self.h4_candles)
+        price = self.h4_candles[-1].close
+        if price > self.ema20_h4 and len(self.swing_highs_h4) >= 2 and len(self.swing_lows_h4) >= 2:
+            if self.swing_highs_h4[-1] > self.swing_highs_h4[-2] and self.swing_lows_h4[-1] > self.swing_lows_h4[-2]: return Direction.BUY
+        if price < self.ema20_h4 and len(self.swing_highs_h4) >= 2 and len(self.swing_lows_h4) >= 2:
+            if self.swing_lows_h4[-1] < self.swing_lows_h4[-2] and self.swing_highs_h4[-1] < self.swing_highs_h4[-2]: return Direction.SELL
+        return Direction.NONE
+
+    def _calc_atr(self, candles, period=14):
+        if len(candles) < period + 1: return candles[-1].high - candles[-1].low if candles else 0.0
+        tr_list = []
+        for i in range(1, len(candles)):
+            c, p = candles[i], candles[i-1]
+            tr = max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close))
+            tr_list.append(tr)
+        return sum(tr_list[-period:]) / period
+
+    def _calc_rsi(self, candles, period=14):
+        if len(candles) < period + 1: return 50.0
+        closes = [c.close for c in candles]
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i-1]
+            gains.append(max(diff, 0)); losses.append(max(-diff, 0))
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        return 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
+    # ========== ТРИГГЕРЫ T1-T3 ==========
+
+    def detect_T1_inside_bar(self):
+        if len(self.h1_candles) < 3: return None
+        context = self.get_h4_context()
+        if context == Direction.NONE: return None
+        self.atr14_h1 = self._calc_atr(self.h1_candles)
+        threshold = self.get_mb_threshold()
+        for i in range(len(self.h1_candles) - 2, 1, -1):
+            mb = self.h1_candles[i-1]; ib = self.h1_candles[i]
+            if (mb.high - mb.low) < threshold * self.atr14_h1: continue
+            if ib.high > mb.high or ib.low < mb.low: continue
+            inner_count = 1
+            for j in range(i-1, max(i-4, -1), -1):
+                c = self.h1_candles[j]
+                if c.high <= mb.high and c.low >= mb.low: inner_count += 1
+                else: break
+            if inner_count > 4: continue
+            current = self.h1_candles[-1]
+            if context == Direction.BUY and current.close > mb.high: return self._build_signal(Direction.BUY, current.close, mb.low, mb.high, "T1_InsideBar")
+            if context == Direction.SELL and current.close < mb.low: return self._build_signal(Direction.SELL, current.close, mb.high, mb.low, "T1_InsideBar")
+        return None
+
+    def detect_T2_narrow_range(self):
+        if len(self.h1_candles) < 6: return None
+        context = self.get_h4_context()
+        if context == Direction.NONE: return None
+        for end_idx in range(len(self.h1_candles) - 1, 4, -1):
+            for length in range(3, 6):
+                start_idx = end_idx - length + 1
+                if start_idx < 0: continue
+                series = self.h1_candles[start_idx:end_idx+1]
+                ranges = [c.high - c.low for c in series]
+                if not all(ranges[j] <= ranges[j-1] for j in range(1, len(ranges))): continue
+                nrh = max(c.high for c in series); nrl = min(c.low for c in series)
+                current = self.h1_candles[-1]
+                if context == Direction.BUY and current.close > nrh: return self._build_signal(Direction.BUY, current.close, nrl, nrh, "T2_NarrowRange")
+                if context == Direction.SELL and current.close < nrl: return self._build_signal(Direction.SELL, current.close, nrh, nrl, "T2_NarrowRange")
+        return None
+
+    def detect_T3_ema_pullback(self):
+        if len(self.h1_candles) < 20: return None
+        context = self.get_h4_context()
+        if context == Direction.NONE: return None
+        self.ema20_h1 = self._calc_ema(self.h1_candles, 20)
+        zone = 0.5
+        for i in range(-3, 0):
+            c = self.h1_candles[i]
+            if context == Direction.BUY:
+                if c.low <= self.ema20_h1 + zone and c.close > self.ema20_h1:
+                    if min(c.open, c.close) - c.low > (c.high - c.low) * 0.3:
+                        return self._build_signal(Direction.BUY, c.close, c.low - zone, self.swing_highs_h4[-1] if self.swing_highs_h4 else c.close + 2*self.atr14_h1, "T3_EMAPullback")
+            else:
+                if c.high >= self.ema20_h1 - zone and c.close < self.ema20_h1:
+                    if c.high - max(c.open, c.close) > (c.high - c.low) * 0.3:
+                        return self._build_signal(Direction.SELL, c.close, c.high + zone, self.swing_lows_h4[-1] if self.swing_lows_h4 else c.close - 2*self.atr14_h1, "T3_EMAPullback")
+        return None
+
+    # ========== НОВЫЕ ТРИГГЕРЫ T4-T6 ==========
+
+    def detect_T4_fake_breakout(self):
+        if len(self.h1_candles) < 4: return None
+        context = self.get_h4_context()
+        if context == Direction.NONE: return None
+        current = self.h1_candles[-1]; prev = self.h1_candles[-2]; prev2 = self.h1_candles[-3]
+        for level in self.swing_highs_h4 + self.swing_lows_h4:
+            if prev2.close < level < prev.close and current.close < level and context == Direction.SELL:
+                return self._build_signal(Direction.SELL, current.close, prev.high, level, "T4_FakeBreakout")
+            if prev2.close > level > prev.close and current.close > level and context == Direction.BUY:
+                return self._build_signal(Direction.BUY, current.close, prev.low, level, "T4_FakeBreakout")
+        return None
+
+    def detect_T5_momentum_breakout(self):
+        """Пробой с ускорением: 3 бара подряд в одну сторону с растущим объёмом"""
+        if len(self.h1_candles) < 5: return None
+        context = self.get_h4_context()
+        if context == Direction.NONE: return None
+        last3 = self.h1_candles[-3:]
+        if context == Direction.BUY:
+            if all(c.close > c.open for c in last3) and all(last3[i].close > last3[i-1].close for i in range(1, 3)):
+                if last3[-1].tick_volume > last3[-2].tick_volume > last3[-3].tick_volume:
+                    return self._build_signal(Direction.BUY, last3[-1].close, last3[0].low, last3[-1].high + self._calc_atr(self.h1_candles), "T5_MomentumBreakout")
+        else:
+            if all(c.close < c.open for c in last3) and all(last3[i].close < last3[i-1].close for i in range(1, 3)):
+                if last3[-1].tick_volume > last3[-2].tick_volume > last3[-3].tick_volume:
+                    return self._build_signal(Direction.SELL, last3[-1].close, last3[0].high, last3[-1].low - self._calc_atr(self.h1_candles), "T5_MomentumBreakout")
+        return None
+
+    def detect_T6_opening_range_breakout(self):
+        """Пробой первого часового диапазона Лондона (7:00-8:00 UTC)"""
+        now = datetime.utcnow()
+        if now.hour < 8 or now.hour > 16: return None
+        context = self.get_h4_context()
+        if context == Direction.NONE: return None
+        london_open_candles = [c for c in self.h1_candles if c.time.hour == 7]
+        if not london_open_candles: return None
+        open_candle = london_open_candles[-1]
+        range_high = open_candle.high; range_low = open_candle.low
+        current = self.h1_candles[-1]
+        if context == Direction.BUY and current.close > range_high:
+            return self._build_signal(Direction.BUY, current.close, range_low, range_high + self._calc_atr(self.h1_candles), "T6_ORB")
+        if context == Direction.SELL and current.close < range_low:
+            return self._build_signal(Direction.SELL, current.close, range_high, range_low - self._calc_atr(self.h1_candles), "T6_ORB")
+        return None
+
+    # ========== ПРОВЕРКИ ==========
+
+    def check_volume_confirmation(self):
+        if len(self.h1_candles) < 6: return False
+        return self.h1_candles[-1].tick_volume > sum(c.tick_volume for c in self.h1_candles[-6:-1]) / 5
+
+    def check_rsi_divergence(self, direction):
+        if len(self.m15_candles) < 20: return False, 0.0
+        window = self.m15_candles[-15:]
+        rsi_vals = [self._calc_rsi(window[max(0,i-7):i+1]) for i in range(7, len(window))]
+        prices = [c.close for c in window[7:]]
+        best_strength = 0.0
+        if direction == Direction.BUY:
+            for i in range(1, len(prices)-1):
+                for j in range(i+1, len(prices)):
+                    if prices[j] < prices[i] and rsi_vals[j] > rsi_vals[i]:
+                        strength = (rsi_vals[j] - rsi_vals[i]) / 30.0
+                        best_strength = max(best_strength, min(strength, 1.0))
+        else:
+            for i in range(1, len(prices)-1):
+                for j in range(i+1, len(prices)):
+                    if prices[j] > prices[i] and rsi_vals[j] < rsi_vals[i]:
+                        strength = (rsi_vals[i] - rsi_vals[j]) / 30.0
+                        best_strength = max(best_strength, min(strength, 1.0))
+        return best_strength > 0.3, best_strength
+
+    def check_target_sufficiency(self, signal):
+        if not self.swing_highs_h4 or not self.swing_lows_h4:
+            signal.r_ratio = 2.0; return True
+        if signal.direction == Direction.BUY:
+            targets = [h for h in self.swing_highs_h4 if h > signal.entry_price]
+            if not targets: signal.r_ratio = 2.0; return True
+            distance = min(targets) - signal.entry_price
+            risk = signal.entry_price - signal.stop_loss
+        else:
+            targets = [l for l in self.swing_lows_h4 if l < signal.entry_price]
+            if not targets: signal.r_ratio = 2.0; return True
+            distance = signal.entry_price - min(targets, key=lambda x: signal.entry_price - x)
+            risk = signal.stop_loss - signal.entry_price
+        signal.r_ratio = distance / risk if risk > 0 else 2.0
+        return signal.r_ratio >= 1.5
+
+    def check_friday_risk(self):
+        """Уменьшает лот и TP в пятницу"""
+        return datetime.utcnow().weekday() == 4
+
+    def check_monday_liquidity(self):
+        """Ждёт первый час Лондона в понедельник"""
+        now = datetime.utcnow()
+        return now.weekday() == 0 and now.hour < 8
+
+    def check_correlation(self, dxy_change=0.0):
+        """Учёт индекса доллара: если DXY растёт, SELL по золоту приоритетнее"""
+        if dxy_change > 0.1: return "bearish_gold"
+        if dxy_change < -0.1: return "bullish_gold"
+        return "neutral"
+
+    # ========== СИГНАЛ И СКОРИНГ ==========
+
+    def _build_signal(self, direction, entry, stop_level, breakout_level, pattern):
+        risk = abs(entry - stop_level)
+        if risk < 1.5: stop_level = entry - 1.5 if direction == Direction.BUY else entry + 1.5; risk = 1.5
+        tp2 = entry + 2 * risk if direction == Direction.BUY else entry - 2 * risk
+        if self.swing_highs_h4 and direction == Direction.BUY:
+            targets = [h for h in self.swing_highs_h4 if h > entry]
+            if targets: tp2 = min(entry + 2*risk, min(targets) - 0.2)
+        if self.swing_lows_h4 and direction == Direction.SELL:
+            targets = [l for l in self.swing_lows_h4 if l < entry]
+            if targets: tp2 = max(entry - 2*risk, min(targets, key=lambda x: entry - x) + 0.2)
+        tp1 = entry + risk if direction == Direction.BUY else entry - risk
+        signal = TradeSignal(direction=direction, entry_price=entry, stop_loss=stop_level,
+                             take_profit=tp2, pattern=pattern, confidence=0.8, r_ratio=2.0)
+        signal.tp1 = tp1
+        return signal
+
+    def score_signal(self, signal, volume_ratio, divergence_strength):
+        score = 0.0
+        patterns = {"T1_InsideBar": 3.0, "T2_NarrowRange": 2.0, "T3_EMAPullback": 1.0,
+                    "T4_FakeBreakout": 3.5, "T5_MomentumBreakout": 2.5, "T6_ORB": 2.0}
+        score += patterns.get(signal.pattern, 1.0)
+        if volume_ratio > 2.0: score += 2.0
+        elif volume_ratio > 1.5: score += 1.0
+        if divergence_strength > 0.8: score += 2.0
+        elif divergence_strength > 0.5: score += 1.0
+        if signal.r_ratio >= 2.5: score += 2.0
+        elif signal.r_ratio >= 2.0: score += 1.0
+        score += self.get_session_confidence()
+        return max(0.0, min(9.0, score))
+
+    # ========== НОВЫЕ МЕТОДЫ (22 функции) ==========
+
+    def trail_stop(self, position, current_price, trail_distance=1.5):
+        if position.direction == Direction.BUY:
+            new_sl = current_price - trail_distance
+            if new_sl > position.stop_loss: position.stop_loss = new_sl; return True
+        else:
+            new_sl = current_price + trail_distance
+            if new_sl < position.stop_loss: position.stop_loss = new_sl; return True
+        return False
+
+    def get_mb_threshold(self):
+        if len(self.h1_candles) < 20: return 0.7
+        atr_now = self._calc_atr(self.h1_candles, 14)
+        atr_old = self._calc_atr(self.h1_candles[:-20], 14) if len(self.h1_candles) > 20 else atr_now
+        return 0.5 if atr_old > 0 and atr_now / atr_old < 0.7 else 0.7
+
+    def filter_weak_levels(self, levels, min_touches=3):
+        return [l for l in levels if sum(1 for c in self.h1_candles[-50:]
+                if abs(c.high - l) < 0.5 or abs(c.low - l) < 0.5) >= min_touches]
+
+    def get_volume_at_level(self, level, tolerance=0.5):
+        return sum(c.tick_volume for c in self.h1_candles[-100:] if abs(c.close - level) < tolerance)
+
+    def get_session_confidence(self):
+        return 1.0 if self.get_session_priority() == 2 else 0.0
+
+    def get_strongest_level(self, levels):
+        if not levels: return None
+        return max(levels, key=lambda l: self.get_volume_at_level(l))
+
+    def get_atr_percentile(self):
+        if len(self.h1_candles) < 100: return 50
+        atrs = [self._calc_atr(self.h1_candles[i:i+14], 14) for i in range(len(self.h1_candles)-14)]
+        current = self._calc_atr(self.h1_candles, 14)
+        return sum(1 for a in atrs if a < current) / len(atrs) * 100
+
+    def calculate_dynamic_lot(self, base_lot, volatility):
+        percentile = self.get_atr_percentile()
+        if percentile > 80: return base_lot * 0.5
+        if percentile < 20: return base_lot * 1.5
+        return base_lot
+
+    def get_optimal_tp(self, entry, direction):
+        atr = self._calc_atr(self.h1_candles, 14)
+        if direction == Direction.BUY: return entry + atr * 2.5
+        return entry - atr * 2.5
+
+    def get_optimal_sl(self, entry, direction):
+        atr = self._calc_atr(self.h1_candles, 14)
+        if direction == Direction.BUY: return entry - atr * 1.2
+        return entry + atr * 1.2
+
+    def detect_divergence_strength(self, direction):
+        _, strength = self.check_rsi_divergence(direction)
+        return strength
+
+    def get_volume_climax(self):
+        """Детектит аномально большой объём (выше 3 сигм)"""
+        if len(self.h1_candles) < 20: return False
+        vols = [c.tick_volume for c in self.h1_candles[-20:]]
+        mean = np.mean(vols); std = np.std(vols)
+        return vols[-1] > mean + 3 * std
+
+    def detect_absorption(self):
+        """Большой объём но маленькое тело свечи — признак разворота"""
+        if len(self.h1_candles) < 2: return None
+        c = self.h1_candles[-1]
+        body = abs(c.close - c.open)
+        avg_body = np.mean([abs(self.h1_candles[i].close - self.h1_candles[i].open) for i in range(-20, -1)])
+        if c.tick_volume > np.mean([x.tick_volume for x in self.h1_candles[-20:-1]]) * 2 and body < avg_body * 0.5:
+            return "BUY" if c.close > c.open else "SELL"
+        return None
+
+    def get_swing_point_age(self):
+        """Сколько часов назад был последний свинг-поинт"""
+        if not self.h4_candles: return 999
+        last_swing_time = self.h4_candles[-1].time
+        for c in reversed(self.h4_candles):
+            if c.high in self.swing_highs_h4 or c.low in self.swing_lows_h4:
+                last_swing_time = c.time; break
+        return (datetime.utcnow() - last_swing_time).total_seconds() / 3600
+
+    def get_regime_confidence(self):
+        """Насколько уверенно определён режим (0-1)"""
+        if abs(self.trend_strength) > 0.05: return 0.9
+        if abs(self.trend_strength) > 0.02: return 0.6
+        return 0.3
+
+    @property
+    def trend_strength(self):
+        if len(self.h4_candles) < 20: return 0.0
+        closes = [c.close for c in self.h4_candles[-20:]]
+        return np.polyfit(range(20), closes, 1)[0] / closes[-1] * 100
+
+    # ========== ГЛАВНЫЙ ПОИСК СИГНАЛА ==========
+
+    def find_signal(self, h4, h1, m15):
+        self.h4_candles = h4; self.h1_candles = h1; self.m15_candles = m15
+
+        if self.news_filter.is_news_near(): return None
+        if self.check_monday_liquidity(): return None
+        if not self.is_active_session(): return None
+        if self.get_h4_context() == Direction.NONE: return None
+
+        signal = None
+        for detector in [self.detect_T1_inside_bar, self.detect_T2_narrow_range, self.detect_T3_ema_pullback,
+                         self.detect_T4_fake_breakout, self.detect_T5_momentum_breakout, self.detect_T6_opening_range_breakout]:
+            signal = detector()
+            if signal: break
+
+        if signal:
+            if not self.check_volume_confirmation(): return None
+            has_div, div_strength = self.check_rsi_divergence(signal.direction)
+            if not has_div: return None
+            if not self.check_target_sufficiency(signal): return None
+
+            avg_vol = sum(c.tick_volume for c in self.h1_candles[-6:-1]) / 5 if len(self.h1_candles) >= 6 else 1
+            vol_ratio = self.h1_candles[-1].tick_volume / avg_vol if avg_vol > 0 else 1
+            score = self.score_signal(signal, vol_ratio, div_strength)
+            signal.confidence = 0.6 + score * 0.04
+            return signal
+
+        return None
+
+# ============================================================
+# MASTER AI — ПОЛНАЯ ВЕРСИЯ (12 НОВЫХ ФУНКЦИЙ)
+# ============================================================
+
+class MasterAI:
+    def __init__(self):
+        self.mt5 = MT5Integration()
+        self.market_intel = MarketIntelligence()
+        self.risk_engine = AdvancedRiskEngine()
+        self.aurum_engine = AurumStrategyEngine()
+        self.position_tracker = PositionTracker()
+        self.analytics_engine = PerformanceAnalyticsEngine()
+        self.chat_engine = ChatEngine()
+        self.decision_engine = DecisionEngine()
+        self.event_bus = EventBus()
+        self.persistence = PersistenceLayer()
+        self.safety_layer = ExecutionSafetyLayer()
+
+        self.mode = StrategyMode.AURUM_V3
+        self.is_running = False
+        self.positions: List[Position] = []
+        self.last_signal: Optional[TradeSignal] = None
+        self.signals_today = 0
+        self.daily_pnl = 0.0
+        self.ticket_counter = 1000
+        self.signal_log = []
+        self.closed_trades_log = []
+        self.weekly_pnl = 0.0
+        self.weekly_trades = 0
+        self.last_weekly_reset = datetime.now()
+
+        self.h4_candles = []
+        self.h1_candles = []
+        self.m15_candles = []
+
+    # ========== ИНИЦИАЛИЗАЦИЯ ==========
+
+    def initialize(self):
+        self.mt5.connect()
+        self._load_state_from_db()
+        self.event_bus.start()
+
+    def _load_state_from_db(self):
+        saved = self.persistence.load_all()
+        if saved:
+            self.signal_log = saved.get("signal_log", [])
+            self.closed_trades_log = saved.get("closed_trades_log", [])
+            logger.info("Сохранённое состояние загружено")
+
+    # ========== РЫНОЧНЫЕ ДАННЫЕ ==========
+
+    def update_market_data(self):
+        try:
+            import MetaTrader5 as mt5_module
+            self.h4_candles = self.mt5.get_rates(SYMBOL, mt5_module.TIMEFRAME_H4 if hasattr(mt5_module, 'TIMEFRAME_H4') else 16388, 100)
+            self.h1_candles = self.mt5.get_rates(SYMBOL, mt5_module.TIMEFRAME_H1 if hasattr(mt5_module, 'TIMEFRAME_H1') else 16385, 100)
+            self.m15_candles = self.mt5.get_rates(SYMBOL, mt5_module.TIMEFRAME_M15 if hasattr(mt5_module, 'TIMEFRAME_M15') else 15, 100)
+            self.market_intel.update(self.h4_candles, self.h1_candles, self.m15_candles)
+        except:
+            pass
+
+    # ========== ПРИНЯТИЕ РЕШЕНИЙ ==========
+
+    def think_and_decide(self):
+        self.update_market_data()
+        if self.mode == StrategyMode.MANUAL: return
+
+        signal = self.aurum_engine.find_signal(self.h4_candles, self.h1_candles, self.m15_candles)
+        if signal is None: return
+
+        self.last_signal = signal
+        avg_vol = sum(c.tick_volume for c in self.h1_candles[-6:-1]) / 5 if len(self.h1_candles) >= 6 else 1
+        vol_ratio = self.h1_candles[-1].tick_volume / avg_vol if avg_vol > 0 else 1
+        _, div_strength = self.aurum_engine.check_rsi_divergence(signal.direction)
+        score = self.aurum_engine.score_signal(signal, vol_ratio, div_strength)
+
+        self.log_signal_quality(signal, score)
+
+        if score <= 2: return
+
+        # Проверка дня недели
+        if self.filter_by_day_of_week() == "skip": return
+
+        if self.decision_engine.make_decision(signal, self.risk_engine):
+            self.execute_trade(signal, score)
+
+    # ========== ИСПОЛНЕНИЕ ==========
+
+    def execute_trade(self, signal: TradeSignal, score: float = 5):
+        if not self.safety_layer.is_execution_allowed(signal, self.positions): return None
+
+        base_lot = self.risk_engine.calculate_position_size(signal.entry_price, signal.stop_loss)
+
+        # Адаптивный лот
+        if score >= 7: lot_mult = 1.0
+        elif score >= 5: lot_mult = 0.6
+        else: lot_mult = 0.3
+
+        # Пятница — уменьшаем лот и TP
+        if self.aurum_engine.check_friday_risk():
+            lot_mult *= 0.5
+            signal.take_profit = signal.entry_price + (signal.take_profit - signal.entry_price) * 0.7 if signal.direction == Direction.BUY else signal.entry_price - (signal.entry_price - signal.take_profit) * 0.7
+
+        lot = max(0.01, round(base_lot * lot_mult, 2))
+        lot = self.aurum_engine.calculate_dynamic_lot(lot, self.market_intel.volatility)
+        lot = self.auto_compound_lot(lot)
+
+        ticket = self.mt5.open_order(SYMBOL, "BUY" if signal.direction == Direction.BUY else "SELL",
+                                     lot, sl=signal.stop_loss, tp=0, comment=f"AURUM_{signal.pattern}")
+
+        if ticket is None: ticket = self.ticket_counter; self.ticket_counter += 1
+
+        position = Position(ticket=ticket, direction=signal.direction, entry_price=signal.entry_price,
+                            stop_loss=signal.stop_loss, take_profit=signal.take_profit, volume=lot,
+                            open_time=datetime.now(), pattern=signal.pattern, tp1=signal.tp1)
+
+        self.positions.append(position)
+        self.signals_today += 1
+        self.safety_layer.on_trade_executed(signal)
+        self.position_tracker.update_position(ticket, {"direction": signal.direction.name, "entry": signal.entry_price,
+                                                       "sl": signal.stop_loss, "tp": signal.take_profit})
+        logger.info(f"✅ #{ticket}: {signal.direction.name} {signal.pattern} | Лот: {lot} | Скор: {score:.0f}/9 | SL: {signal.stop_loss:.2f}")
+        return position
+
+    # ========== УПРАВЛЕНИЕ ПОЗИЦИЯМИ ==========
+
+    def manage_open_positions(self):
+        for pos in self.positions[:]:
+            price = self.mt5._get_real_price(SYMBOL, "BUY" if pos.direction == Direction.BUY else "SELL")
+            if price == 0: continue
+
+            # Обновляем экстремумы
+            if pos.direction == Direction.BUY:
+                pos.highest_price = max(pos.highest_price, price)
+            else:
+                pos.lowest_price = min(pos.lowest_price, price)
+
+            tp1_hit = (pos.direction == Direction.BUY and price >= pos.tp1) or (pos.direction == Direction.SELL and price <= pos.tp1)
+            tp2_hit = (pos.direction == Direction.BUY and price >= pos.take_profit) or (pos.direction == Direction.SELL and price <= pos.take_profit)
+
+            if tp1_hit and not pos.is_breakeven:
+                half_vol = round(pos.volume / 2, 2)
+                if half_vol >= 0.01:
+                    self.mt5.close_position(pos.ticket, half_vol)
+                    pos.volume -= half_vol
+                    profit_1r = (pos.tp1 - pos.entry_price) if pos.direction == Direction.BUY else (pos.entry_price - pos.tp1)
+                    realized = profit_1r * half_vol * 100
+                    self.daily_pnl += realized; self.weekly_pnl += realized
+                    pos.tp1_hit = True
+                    logger.info(f"TP1 #{pos.ticket}: +{realized:.2f}$ (50% закрыто, остаток в безубытке)")
+                pos.stop_loss = pos.entry_price; pos.is_breakeven = True
+                self.mt5.modify_position(pos.ticket, sl=pos.entry_price, tp=pos.take_profit)
+
+            if tp2_hit:
+                profit = (pos.take_profit - pos.entry_price) if pos.direction == Direction.BUY else (pos.entry_price - pos.take_profit)
+                realized = profit * pos.volume * 100
+                self._close_full_position(pos, price, "TP2")
+                self.daily_pnl += realized; self.weekly_pnl += realized
+
+            # Трейлинг-стоп
+            if pos.is_breakeven:
+                self.trail_all_positions()
+
+    def trail_all_positions(self, trail_distance=1.5):
+        for pos in self.positions:
+            if not pos.is_breakeven: continue
+            price = self.mt5._get_real_price(SYMBOL, "BUY" if pos.direction == Direction.BUY else "SELL")
+            if price == 0: continue
+            if self.aurum_engine.trail_stop(pos, price, trail_distance):
+                self.mt5.modify_position(pos.ticket, sl=pos.stop_loss)
+
+    def _close_full_position(self, pos: Position, price: float, reason: str):
+        self.mt5.close_position(pos.ticket)
+        profit = (price - pos.entry_price) if pos.direction == Direction.BUY else (pos.entry_price - price)
+        realized = profit * pos.volume * 100
+        self.daily_pnl += realized; self.weekly_pnl += realized; self.weekly_trades += 1
+        self.positions.remove(pos)
+        self.position_tracker.remove_position(pos.ticket)
+        self.risk_engine.record_trade_result(realized)
+        profit_for_stats = realized if pos.tp1_hit or reason == "TP2" else realized
+        self.analytics_engine.record_trade_result({
+            "ticket": pos.ticket, "profit": profit_for_stats if profit_for_stats > 0 else realized,
+            "pattern": pos.pattern, "hour": datetime.now().hour,
+            "day": datetime.now().strftime("%A"), "regime": self.market_intel.get_regime()
+        })
+        self.replay_closed_trades(pos, realized)
+        logger.info(f"{reason} #{pos.ticket}: +{realized:.2f}$")
+
+    # ========== НОВЫЕ МЕТОДЫ (12 функций) ==========
+
+    def auto_compound_lot(self, base_lot):
+        """Автоувеличение лота при росте депозита"""
+        growth = self.risk_engine.current_balance / max(self.risk_engine.initial_balance, 1)
+        return round(base_lot * min(growth, 2.0), 2)
+
+    def daily_reset_stats(self):
+        """Сброс дневной статистики в 00:00"""
+        now = datetime.now()
+        if now.hour == 0 and now.minute == 0:
+            self.signals_today = 0; self.daily_pnl = 0.0
+            logger.info("Дневная статистика сброшена")
+
+    def weekly_report(self):
+        """Сводка за неделю"""
+        if (datetime.now() - self.last_weekly_reset).days >= 7:
+            report = {"trades": self.weekly_trades, "pnl": self.weekly_pnl,
+                      "win_rate": self.risk_engine.get_win_rate()}
+            self.weekly_trades = 0; self.weekly_pnl = 0.0; self.last_weekly_reset = datetime.now()
+            return report
+        return {"trades": self.weekly_trades, "pnl": self.weekly_pnl, "win_rate": self.risk_engine.get_win_rate()}
+
+    def check_drawdown_limit(self, max_drawdown_percent=15.0):
+        """Стоп-торговля при просадке > N%"""
+        dd = (self.risk_engine.initial_balance - self.risk_engine.current_balance) / self.risk_engine.initial_balance * 100
+        if dd > max_drawdown_percent:
+            self.safety_layer.activate_kill_switch(f"Просадка {dd:.1f}%")
+            return True
+        return False
+
+    def emergency_reduce_lot(self):
+        """Уменьшает лот вдвое после 3 убытков подряд"""
+        if self.risk_engine.consecutive_losses >= 3:
+            return 0.5
+        return 1.0
+
+    def get_best_trading_hours(self):
+        return self.analytics_engine.get_best_trading_hours()
+
+    def get_worst_trading_hours(self):
+        return self.analytics_engine.get_worst_trading_hours()
+
+    def filter_by_day_of_week(self):
+        """Пропуск или уменьшение лота по дням"""
+        day = datetime.now().strftime("%A")
+        day_stats = self.analytics_engine.filter_by_day_of_week(day)
+        if day_stats:
+            avg_pnl = sum(day_stats) / len(day_stats)
+            if avg_pnl < -50: return "skip"
+            if avg_pnl < 0: return "reduce"
+        return "normal"
+
+    def adaptive_risk_per_trade(self):
+        """Меняет % риска от винрейта"""
+        wr = self.risk_engine.get_win_rate()
+        if wr > 0.7: return self.risk_engine.max_risk_percent * 1.5
+        if wr < 0.4: return self.risk_engine.max_risk_percent * 0.5
+        return self.risk_engine.max_risk_percent
+
+    def log_signal_quality(self, signal, score):
+        """Записывает скор для анализа"""
+        self.signal_log.append({
+            "time": datetime.now().isoformat(),
+            "pattern": signal.pattern,
+            "direction": signal.direction.name,
+            "score": score,
+            "confidence": signal.confidence,
+            "r_ratio": signal.r_ratio
+        })
+        if len(self.signal_log) > 1000: self.signal_log = self.signal_log[-500:]
+
+    def replay_closed_trades(self, position, realized_pnl):
+        """Анализ что пошло не так"""
+        self.closed_trades_log.append({
+            "ticket": position.ticket,
+            "pattern": position.pattern,
+            "direction": position.direction.name,
+            "entry": position.entry_price,
+            "tp": position.take_profit,
+            "sl": position.stop_loss,
+            "pnl": realized_pnl,
+            "tp1_hit": position.tp1_hit,
+            "open_time": position.open_time.isoformat(),
+            "close_time": datetime.now().isoformat()
+        })
+        if len(self.closed_trades_log) > 500: self.closed_trades_log = self.closed_trades_log[-250:]
+
+    # ========== ЧАТ И СТАТУС ==========
+
+    def chat(self, message: str) -> str:
+        msg_lower = message.lower().strip()
+        if msg_lower.startswith('/mode'):
+            parts = msg_lower.split()
+            if len(parts) > 1:
+                mode_map = {"aurum": StrategyMode.AURUM_V3, "manual": StrategyMode.MANUAL}
+                if parts[1] in mode_map:
+                    self.mode = mode_map[parts[1]]
+                    return f"✅ Режим: **{self.mode.value.upper()}**"
+            return "Укажите: /mode aurum, /mode manual"
+
+        weekly = self.weekly_report()
+        analytics = self.get_analytics_report()
+        context = {
+            "status": self.get_status(),
+            "positions": [{"direction": p.direction.name, "entry": p.entry_price,
+                           "sl": p.stop_loss, "tp": p.take_profit, "pnl": 0} for p in self.positions],
+            "last_signal": {"direction": self.last_signal.direction.name, "pattern": self.last_signal.pattern,
+                            "entry": self.last_signal.entry_price, "r_ratio": self.last_signal.r_ratio,
+                            "score": self.signal_log[-1]["score"] if self.signal_log else 0} if self.last_signal else None,
+            "session_active": self.aurum_engine.is_active_session(),
+            "weekly_report": weekly,
+            "analytics": analytics,
+            "regime": self.market_intel.get_regime()
+        }
+        return self.chat_engine.generate_response(message, context)
+
+    def get_status(self) -> Dict:
+        return {
+            "mode": self.mode.value,
+            "session_active": self.aurum_engine.is_active_session(),
+            "h4_context": self.aurum_engine.get_h4_context().name if self.h4_candles else "N/A",
+            "open_positions": len(self.positions),
+            "signals_today": self.signals_today,
+            "daily_pnl": round(self.daily_pnl, 2),
+            "risk_score": self.risk_engine.compute_portfolio_risk_score(),
+            "market_regime": self.market_intel.get_regime()
+        }
+
+    def get_analytics_report(self) -> Dict:
+        return self.analytics_engine.get_full_report()
+
+    def get_full_institutional_report(self) -> Dict:
+        weekly = self.weekly_report()
+        return {
+            "status": self.get_status(),
+            "analytics": self.get_analytics_report(),
+            "risk": self.risk_engine.get_full_risk_report(),
+            "market": self.market_intel.get_market_summary(),
+            "safety": self.safety_layer.get_safety_report(),
+            "weekly": weekly,
+            "signal_log_size": len(self.signal_log),
+            "closed_trades_size": len(self.closed_trades_log)
+        }
+
+    # ========== АВТОТОРГОВЛЯ ==========
+
+    def on_autotrade_start(self):
+        self.is_running = True
+        threading.Thread(target=self._main_loop, daemon=True).start()
+        return "✅ Автоторговля запущена"
+
+    def on_autotrade_stop(self):
+        self.is_running = False
+        return "⏹ Автоторговля остановлена"
+
+    def _main_loop(self):
+        while self.is_running:
+            try:
+                self.daily_reset_stats()
+                self.check_drawdown_limit()
+                self.think_and_decide()
+                self.manage_open_positions()
+            except Exception as e:
+                logger.error(f"Ошибка цикла: {e}")
+            time.sleep(60)
+
+    def shutdown(self):
+        self.is_running = False
+        self.persistence.save_all({
+            "analytics": self.analytics_engine,
+            "risk": self.risk_engine,
+            "signal_log": self.signal_log,
+            "closed_trades_log": self.closed_trades_log
+        })
+        self.mt5.disconnect()
+        self.event_bus.stop()
+
+    def manual_kill_switch(self):
+        self.safety_layer.activate_kill_switch("manual")
+        return "KILL SWITCH активирован"
+
+    def emergency_flatten(self):
+        for pos in self.positions[:]:
+            self.mt5.close_position(pos.ticket)
+        self.positions.clear()
+        return "Все позиции закрыты"
+
+# ============================================================
+# ДЕМОНСТРАЦИЯ
+# ============================================================
+
+def demo():
+    print("=" * 60)
+    print("   AURUM V3.0 — ПОЛНАЯ ВЕРСИЯ (48 функций)")
+    print("=" * 60)
+
+    ai = MasterAI()
+    ai.initialize()
+    ai.update_market_data()
+
+    print("\n💬 ЧАТ:")
+    for msg in ["Привет!", "/status", "Расскажи про стратегию", "/weekly", "/report"]:
+        print(f"👤: {msg}")
+        print(f"🤖: {ai.chat(msg)}")
+
+    print("\n🔍 ПОИСК СИГНАЛА:")
+    original = ai.aurum_engine.is_active_session
+    ai.aurum_engine.is_active_session = lambda: True
+    signal = ai.aurum_engine.find_signal(ai.h4_candles, ai.h1_candles, ai.m15_candles)
+    if signal:
+        print(f"✅ {signal.direction.name} | {signal.pattern} | R={signal.r_ratio:.1f} | Conf={signal.confidence:.2f}")
+    else:
+        print("ℹ️ Сигнал не найден")
+    ai.aurum_engine.is_active_session = original
+
+    print("\n📊 РЫНОЧНАЯ АНАЛИТИКА:")
+    print(f"  Режим: {ai.market_intel.get_regime()}")
+    print(f"  Структура: {ai.market_intel.detect_market_structure()}")
+    print(f"  CHoCH: {ai.market_intel.detect_choch()}")
+    print(f"  BOS: {ai.market_intel.detect_bos()}")
+    print(f"  Premium/Discount: {ai.market_intel.get_premium_discount()}")
+    print(f"  Order Blocks: {len(ai.market_intel.order_blocks)}")
+    print(f"  FVG Zones: {len(ai.market_intel.fvg_zones)}")
+    print(f"  Liquidity Zones: {len(ai.market_intel.liquidity_zones)}")
+
+    ai.shutdown()
+
+if __name__ == "__main__":
+    demo()
